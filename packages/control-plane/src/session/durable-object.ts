@@ -23,25 +23,12 @@ import type {
   SandboxEvent,
   SessionState,
   ParticipantPresence,
+  SandboxStatus,
+  MessageSource,
+  ParticipantRole,
 } from "../types";
-import type {
-  SessionRow,
-  ParticipantRow,
-  MessageRow,
-  EventRow,
-  ArtifactRow,
-  SandboxRow,
-  SandboxCommand,
-} from "./types";
-
-/**
- * Message row with joined participant info for author attribution.
- */
-type MessageWithParticipant = MessageRow & {
-  participant_id: string | null;
-  github_name: string | null;
-  github_login: string | null;
-};
+import type { SessionRow, ParticipantRow, EventRow, SandboxRow, SandboxCommand } from "./types";
+import { SessionRepository, type MessageWithParticipant } from "./repository";
 
 /**
  * Build GitHub avatar URL from login.
@@ -90,6 +77,7 @@ interface InternalRoute {
 
 export class SessionDO extends DurableObject<Env> {
   private sql: SqlStorage;
+  private repository: SessionRepository;
   private clients: Map<WebSocket, ClientInfo>;
   private sandboxWs: WebSocket | null = null;
   private initialized = false;
@@ -142,6 +130,7 @@ export class SessionDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.repository = new SessionRepository(this.sql);
     this.clients = new Map();
   }
 
@@ -387,12 +376,7 @@ export class SessionDO extends DurableObject<Env> {
     const wsIdTag = tags.find((t) => t.startsWith("wsid:"));
     if (wsIdTag) {
       const tagWsId = wsIdTag.replace("wsid:", "");
-      const mappingResult = this.sql.exec(
-        `SELECT participant_id FROM ws_client_mapping WHERE ws_id = ?`,
-        tagWsId
-      );
-      const mappings = mappingResult.toArray() as { participant_id: string }[];
-      if (mappings.length > 0) {
+      if (this.repository.hasWsClientMapping(tagWsId)) {
         return; // Was authenticated before hibernation
       }
     }
@@ -555,10 +539,7 @@ export class SessionDO extends DurableObject<Env> {
    * Update the last activity timestamp.
    */
   private updateLastActivity(timestamp: number): void {
-    this.sql.exec(
-      `UPDATE sandbox SET last_activity = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-      timestamp
-    );
+    this.repository.updateSandboxLastActivity(timestamp);
   }
 
   /**
@@ -656,11 +637,7 @@ export class SessionDO extends DurableObject<Env> {
 
       if (result.success && result.data?.image_id) {
         // Store snapshot image ID for later restoration
-        this.sql.exec(
-          `UPDATE sandbox SET snapshot_image_id = ? WHERE id = ?`,
-          result.data.image_id,
-          sandbox.id
-        );
+        this.repository.updateSandboxSnapshotImageId(sandbox.id, result.data.image_id);
         console.log(`[DO] Snapshot saved: ${result.data.image_id}`);
         this.broadcast({
           type: "snapshot_saved",
@@ -704,17 +681,12 @@ export class SessionDO extends DurableObject<Env> {
       const expectedSandboxId = `sandbox-${session.repo_owner}-${session.repo_name}-${now}`;
 
       // Store expected sandbox ID and auth token before calling Modal
-      this.sql.exec(
-        `UPDATE sandbox SET
-           status = 'spawning',
-           created_at = ?,
-           auth_token = ?,
-           modal_sandbox_id = ?
-         WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-        now,
-        sandboxAuthToken,
-        expectedSandboxId
-      );
+      this.repository.updateSandboxForSpawn({
+        status: "spawning",
+        createdAt: now,
+        authToken: sandboxAuthToken,
+        modalSandboxId: expectedSandboxId,
+      });
 
       // Verify Modal configuration
       const modalApiSecret = this.env.MODAL_API_SECRET;
@@ -906,14 +878,12 @@ export class SessionDO extends DurableObject<Env> {
       const wsId = wsIdTag.replace("wsid:", "");
       const now = Date.now();
       // Upsert the mapping (in case of reconnection)
-      this.sql.exec(
-        `INSERT OR REPLACE INTO ws_client_mapping (ws_id, participant_id, client_id, created_at)
-         VALUES (?, ?, ?, ?)`,
+      this.repository.upsertWsClientMapping({
         wsId,
-        participant.id,
-        data.clientId,
-        now
-      );
+        participantId: participant.id,
+        clientId: data.clientId,
+        createdAt: now,
+      });
       console.log(`[DO] Stored ws_client_mapping: wsId=${wsId}, participant=${participant.id}`);
     }
 
@@ -954,17 +924,10 @@ export class SessionDO extends DurableObject<Env> {
    */
   private sendHistoricalEvents(ws: WebSocket): void {
     // Get messages with participant info (user prompts)
-    const messagesResult = this.sql.exec(
-      `SELECT m.*, p.id as participant_id, p.github_name, p.github_login
-       FROM messages m
-       LEFT JOIN participants p ON m.author_id = p.id
-       ORDER BY m.created_at ASC LIMIT 100`
-    );
-    const messages = messagesResult.toArray() as unknown as MessageWithParticipant[];
+    const messages = this.repository.getMessagesWithParticipants(100);
 
     // Get events (tool calls, tokens, etc.)
-    const eventsResult = this.sql.exec(`SELECT * FROM events ORDER BY created_at ASC LIMIT 500`);
-    const events = eventsResult.toArray() as unknown as EventRow[];
+    const events = this.repository.getEventsForReplay(500);
 
     // Combine and sort by timestamp
     interface HistoryItem {
@@ -1033,23 +996,9 @@ export class SessionDO extends DurableObject<Env> {
       const wsIdTag = tags.find((t) => t.startsWith("wsid:"));
       if (wsIdTag) {
         const wsId = wsIdTag.replace("wsid:", "");
-        const mappingResult = this.sql.exec(
-          `SELECT m.participant_id, m.client_id, p.user_id, p.github_name, p.github_login
-           FROM ws_client_mapping m
-           JOIN participants p ON m.participant_id = p.id
-           WHERE m.ws_id = ?`,
-          wsId
-        );
-        const mappings = mappingResult.toArray() as {
-          participant_id: string;
-          client_id: string;
-          user_id: string;
-          github_name: string | null;
-          github_login: string | null;
-        }[];
+        const mapping = this.repository.getWsClientMapping(wsId);
 
-        if (mappings.length > 0) {
-          const mapping = mappings[0];
+        if (mapping) {
           console.log(`[DO] Recovered client info from DB: wsId=${wsId}, user=${mapping.user_id}`);
           client = {
             participantId: mapping.participant_id,
@@ -1116,24 +1065,19 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     // Insert message with optional model override
-    this.sql.exec(
-      `INSERT INTO messages (id, author_id, content, source, model, attachments, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      messageId,
-      participant.id,
-      data.content,
-      "web",
-      messageModel,
-      data.attachments ? JSON.stringify(data.attachments) : null,
-      "pending",
-      now
-    );
+    this.repository.createMessage({
+      id: messageId,
+      authorId: participant.id,
+      content: data.content,
+      source: "web",
+      model: messageModel,
+      attachments: data.attachments ? JSON.stringify(data.attachments) : null,
+      status: "pending",
+      createdAt: now,
+    });
 
     // Get queue position
-    const queueResult = this.sql.exec(
-      `SELECT COUNT(*) as count FROM messages WHERE status IN ('pending', 'processing')`
-    );
-    const position = (queueResult.one() as { count: number }).count;
+    const position = this.repository.getPendingOrProcessingCount();
 
     // Confirm to sender
     this.safeSend(ws, {
@@ -1187,21 +1131,17 @@ export class SessionDO extends DurableObject<Env> {
     // Only fall back to DB lookup if event doesn't include messageId (legacy fallback)
     // This prevents race conditions where events from message A arrive after message B starts processing
     const eventMessageId = "messageId" in event ? event.messageId : null;
-    const processingResult = this.sql
-      .exec(`SELECT id FROM messages WHERE status = 'processing' LIMIT 1`)
-      .toArray() as Array<{ id: string }>;
-    const messageId = eventMessageId ?? processingResult[0]?.id ?? null;
+    const processingMessage = this.repository.getProcessingMessage();
+    const messageId = eventMessageId ?? processingMessage?.id ?? null;
 
     // Store event
-    this.sql.exec(
-      `INSERT INTO events (id, type, data, message_id, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      eventId,
-      event.type,
-      JSON.stringify(event),
+    this.repository.createEvent({
+      id: eventId,
+      type: event.type,
+      data: JSON.stringify(event),
       messageId,
-      now
-    );
+      createdAt: now,
+    });
 
     // Handle specific event types
     if (event.type === "execution_complete") {
@@ -1210,12 +1150,7 @@ export class SessionDO extends DurableObject<Env> {
       const status = event.success ? "completed" : "failed";
 
       if (completionMessageId) {
-        this.sql.exec(
-          `UPDATE messages SET status = ?, completed_at = ? WHERE id = ?`,
-          status,
-          now,
-          completionMessageId
-        );
+        this.repository.updateMessageCompletion(completionMessageId, status, now);
 
         // Broadcast processing status change (after DB update so getIsProcessing is accurate)
         this.broadcast({ type: "processing_status", isProcessing: this.getIsProcessing() });
@@ -1240,21 +1175,15 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     if (event.type === "git_sync") {
-      this.sql.exec(
-        `UPDATE sandbox SET git_sync_status = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-        event.status
-      );
+      this.repository.updateSandboxGitSyncStatus(event.status);
 
       if (event.sha) {
-        this.sql.exec(`UPDATE session SET current_sha = ?`, event.sha);
+        this.repository.updateSessionCurrentSha(event.sha);
       }
     }
 
     if (event.type === "heartbeat") {
-      this.sql.exec(
-        `UPDATE sandbox SET last_heartbeat = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-        now
-      );
+      this.repository.updateSandboxHeartbeat(now);
       // Note: Don't schedule separate heartbeat alarm - it's handled in the main alarm()
       // which checks both inactivity and heartbeat health
     }
@@ -1436,23 +1365,17 @@ export class SessionDO extends DurableObject<Env> {
     console.log("processMessageQueue: start");
 
     // Check if already processing
-    const processing = this.sql.exec(`SELECT id FROM messages WHERE status = 'processing' LIMIT 1`);
-    if (processing.toArray().length > 0) {
+    if (this.repository.getProcessingMessage()) {
       console.log("processMessageQueue: already processing, returning");
       return;
     }
 
     // Get next pending message
-    const pending = this.sql.exec(
-      `SELECT * FROM messages WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`
-    );
-    const messages = pending.toArray() as unknown as MessageRow[];
-    if (messages.length === 0) {
+    const message = this.repository.getNextPendingMessage();
+    if (!message) {
       console.log("processMessageQueue: no pending messages");
       return;
     }
-
-    const message = messages[0];
     console.log("processMessageQueue: found message", message.id);
     const now = Date.now();
 
@@ -1475,11 +1398,7 @@ export class SessionDO extends DurableObject<Env> {
 
     console.log("processMessageQueue: marking as processing");
     // Mark as processing
-    this.sql.exec(
-      `UPDATE messages SET status = 'processing', started_at = ? WHERE id = ?`,
-      now,
-      message.id
-    );
+    this.repository.updateMessageToProcessing(message.id, now);
 
     // Broadcast processing status change (hardcoded true since we just set status above)
     this.broadcast({ type: "processing_status", isProcessing: true });
@@ -1489,12 +1408,7 @@ export class SessionDO extends DurableObject<Env> {
 
     // Get author info (use toArray since author may not exist in participants table)
     console.log("processMessageQueue: getting author", message.author_id);
-    const authorResult = this.sql.exec(
-      `SELECT * FROM participants WHERE id = ?`,
-      message.author_id
-    );
-    const authorRows = authorResult.toArray() as unknown as ParticipantRow[];
-    const author = authorRows[0] ?? null;
+    const author = this.repository.getParticipantById(message.author_id);
     console.log("processMessageQueue: author found", !!author);
 
     // Get session for default model
@@ -1549,9 +1463,7 @@ export class SessionDO extends DurableObject<Env> {
     // Reset circuit breaker if window has passed
     if (spawnFailureCount > 0 && timeSinceLastFailure >= CIRCUIT_BREAKER_WINDOW_MS) {
       console.log("[DO] Circuit breaker window passed, resetting failure count");
-      this.sql.exec(
-        `UPDATE sandbox SET spawn_failure_count = 0 WHERE id = (SELECT id FROM sandbox LIMIT 1)`
-      );
+      this.repository.resetCircuitBreaker();
     }
 
     return true;
@@ -1562,21 +1474,12 @@ export class SessionDO extends DurableObject<Env> {
    */
   private async spawnSandbox(): Promise<void> {
     // Check persisted status and last spawn time to prevent duplicate spawns
-    const sandboxResult = this.sql.exec(
-      `SELECT status, created_at, snapshot_image_id, spawn_failure_count, last_spawn_failure FROM sandbox LIMIT 1`
-    );
-    const sandboxRows = sandboxResult.toArray() as {
-      status: string;
-      created_at: number;
-      snapshot_image_id: string | null;
-      spawn_failure_count: number | null;
-      last_spawn_failure: number | null;
-    }[];
-    const currentStatus = sandboxRows[0]?.status;
-    const lastSpawnTime = sandboxRows[0]?.created_at || 0;
-    const snapshotImageId = sandboxRows[0]?.snapshot_image_id;
-    const spawnFailureCount = sandboxRows[0]?.spawn_failure_count || 0;
-    const lastSpawnFailure = sandboxRows[0]?.last_spawn_failure || 0;
+    const sandboxState = this.repository.getSandboxWithCircuitBreaker();
+    const currentStatus = sandboxState?.status;
+    const lastSpawnTime = sandboxState?.created_at || 0;
+    const snapshotImageId = sandboxState?.snapshot_image_id;
+    const spawnFailureCount = sandboxState?.spawn_failure_count || 0;
+    const lastSpawnFailure = sandboxState?.last_spawn_failure || 0;
     const now = Date.now();
     const timeSinceLastSpawn = now - lastSpawnTime;
 
@@ -1648,17 +1551,12 @@ export class SessionDO extends DurableObject<Env> {
 
       // Store status, auth token, AND expected sandbox ID BEFORE calling Modal
       // This prevents race conditions where sandbox connects before we've stored expected ID
-      this.sql.exec(
-        `UPDATE sandbox SET
-           status = 'spawning',
-           created_at = ?,
-           auth_token = ?,
-           modal_sandbox_id = ?
-         WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-        now,
-        sandboxAuthToken,
-        expectedSandboxId
-      );
+      this.repository.updateSandboxForSpawn({
+        status: "spawning",
+        createdAt: now,
+        authToken: sandboxAuthToken,
+        modalSandboxId: expectedSandboxId,
+      });
       this.broadcast({ type: "sandbox_status", status: "spawning" });
       console.log(
         `[DO] Creating sandbox via Modal API: ${session.session_name}, expectedId=${expectedSandboxId}`
@@ -1698,10 +1596,7 @@ export class SessionDO extends DurableObject<Env> {
 
       // Store Modal's internal object ID for snapshot API calls
       if (result.modalObjectId) {
-        this.sql.exec(
-          `UPDATE sandbox SET modal_object_id = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-          result.modalObjectId
-        );
+        this.repository.updateSandboxModalObjectId(result.modalObjectId);
         console.log(`[DO] Stored modal_object_id: ${result.modalObjectId}`);
       }
 
@@ -1709,21 +1604,13 @@ export class SessionDO extends DurableObject<Env> {
       this.broadcast({ type: "sandbox_status", status: "connecting" });
 
       // Reset circuit breaker on successful spawn initiation
-      this.sql.exec(
-        `UPDATE sandbox SET spawn_failure_count = 0 WHERE id = (SELECT id FROM sandbox LIMIT 1)`
-      );
+      this.repository.resetCircuitBreaker();
     } catch (error) {
       console.error("Failed to spawn sandbox:", error);
 
       // Increment circuit breaker failure count
       const failureNow = Date.now();
-      this.sql.exec(
-        `UPDATE sandbox SET
-           spawn_failure_count = COALESCE(spawn_failure_count, 0) + 1,
-           last_spawn_failure = ?
-         WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-        failureNow
-      );
+      this.repository.incrementCircuitBreakerFailure(failureNow);
       console.log("[DO] Incremented spawn failure count for circuit breaker");
 
       this.updateSandboxStatus("failed");
@@ -1816,22 +1703,17 @@ export class SessionDO extends DurableObject<Env> {
    * Check if any message is currently being processed.
    */
   private getIsProcessing(): boolean {
-    const result = this.sql.exec(`SELECT id FROM messages WHERE status = 'processing' LIMIT 1`);
-    return result.toArray().length > 0;
+    return this.repository.getProcessingMessage() !== null;
   }
 
   // Database helpers
 
   private getSession(): SessionRow | null {
-    const result = this.sql.exec(`SELECT * FROM session LIMIT 1`);
-    const rows = result.toArray() as unknown as SessionRow[];
-    return rows[0] ?? null;
+    return this.repository.getSession();
   }
 
   private getSandbox(): SandboxRow | null {
-    const result = this.sql.exec(`SELECT * FROM sandbox LIMIT 1`);
-    const rows = result.toArray() as unknown as SandboxRow[];
-    return rows[0] ?? null;
+    return this.repository.getSandbox();
   }
 
   /**
@@ -1883,29 +1765,24 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private getMessageCount(): number {
-    const result = this.sql.exec(`SELECT COUNT(*) as count FROM messages`);
-    return (result.one() as { count: number }).count;
+    return this.repository.getMessageCount();
   }
 
   private getParticipantByUserId(userId: string): ParticipantRow | null {
-    const result = this.sql.exec(`SELECT * FROM participants WHERE user_id = ?`, userId);
-    const rows = result.toArray() as unknown as ParticipantRow[];
-    return rows[0] ?? null;
+    return this.repository.getParticipantByUserId(userId);
   }
 
   private createParticipant(userId: string, name: string): ParticipantRow {
     const id = generateId();
     const now = Date.now();
 
-    this.sql.exec(
-      `INSERT INTO participants (id, user_id, github_name, role, joined_at)
-       VALUES (?, ?, ?, ?, ?)`,
+    this.repository.createParticipant({
       id,
       userId,
-      name,
-      "member",
-      now
-    );
+      githubName: name,
+      role: "member",
+      joinedAt: now,
+    });
 
     return {
       id,
@@ -1925,10 +1802,7 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private updateSandboxStatus(status: string): void {
-    this.sql.exec(
-      `UPDATE sandbox SET status = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-      status
-    );
+    this.repository.updateSandboxStatus(status as SandboxStatus);
   }
 
   /**
@@ -1956,11 +1830,7 @@ export class SessionDO extends DurableObject<Env> {
    */
   private async notifySlackBot(messageId: string, success: boolean): Promise<void> {
     // Safely query for callback context
-    const result = this.sql
-      .exec(`SELECT callback_context FROM messages WHERE id = ?`, messageId)
-      .toArray() as Array<{ callback_context: string | null }>;
-
-    const message = result[0];
+    const message = this.repository.getMessageCallbackContext(messageId);
     if (!message?.callback_context) {
       console.log(`[DO] No callback context for message ${messageId}, skipping notification`);
       return;
@@ -2040,12 +1910,9 @@ export class SessionDO extends DurableObject<Env> {
     | { user?: never; error: string; status: number }
   > {
     // Find the currently processing message
-    const processingResult = this.sql.exec(
-      `SELECT author_id FROM messages WHERE status = 'processing' LIMIT 1`
-    );
-    const processingRows = processingResult.toArray() as Array<{ author_id: string }>;
+    const processingMessage = this.repository.getProcessingMessageAuthor();
 
-    if (processingRows.length === 0) {
+    if (!processingMessage) {
       console.log("[DO] PR creation failed: no processing message found");
       return {
         error: "No active prompt found. PR creation must be triggered by a user prompt.",
@@ -2053,15 +1920,10 @@ export class SessionDO extends DurableObject<Env> {
       };
     }
 
-    const participantId = processingRows[0].author_id;
+    const participantId = processingMessage.author_id;
 
     // Get the participant record
-    const participantResult = this.sql.exec(
-      `SELECT * FROM participants WHERE id = ?`,
-      participantId
-    );
-    const participants = participantResult.toArray() as unknown as ParticipantRow[];
-    const participant = participants[0];
+    const participant = this.repository.getParticipantById(participantId);
 
     if (!participant) {
       console.log(`[DO] PR creation failed: participant not found for id=${participantId}`);
@@ -2127,47 +1989,41 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     // Create session (store both internal ID and external name)
-    this.sql.exec(
-      `INSERT OR REPLACE INTO session (id, session_name, title, repo_owner, repo_name, model, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      sessionId,
+    this.repository.upsertSession({
+      id: sessionId,
       sessionName, // Store the session name for WebSocket routing
-      body.title ?? null,
-      body.repoOwner,
-      body.repoName,
+      title: body.title ?? null,
+      repoOwner: body.repoOwner,
+      repoName: body.repoName,
       model,
-      "created",
-      now,
-      now
-    );
+      status: "created",
+      createdAt: now,
+      updatedAt: now,
+    });
 
     // Create sandbox record
     // Note: created_at is set to 0 initially so the first spawn isn't blocked by cooldown
     // It will be updated to the actual spawn time when spawnSandbox() is called
     const sandboxId = generateId();
-    this.sql.exec(
-      `INSERT INTO sandbox (id, status, git_sync_status, created_at)
-       VALUES (?, ?, ?, ?)`,
-      sandboxId,
-      "pending",
-      "pending",
-      0
-    );
+    this.repository.createSandbox({
+      id: sandboxId,
+      status: "pending",
+      gitSyncStatus: "pending",
+      createdAt: 0,
+    });
 
     // Create owner participant with encrypted GitHub token
     const participantId = generateId();
-    this.sql.exec(
-      `INSERT INTO participants (id, user_id, github_login, github_name, github_email, github_access_token_encrypted, role, joined_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      participantId,
-      body.userId,
-      body.githubLogin ?? null,
-      body.githubName ?? null,
-      body.githubEmail ?? null,
-      encryptedToken,
-      "owner",
-      now
-    );
+    this.repository.createParticipant({
+      id: participantId,
+      userId: body.userId,
+      githubLogin: body.githubLogin ?? null,
+      githubName: body.githubName ?? null,
+      githubEmail: body.githubEmail ?? null,
+      githubAccessTokenEncrypted: encryptedToken,
+      role: "owner",
+      joinedAt: now,
+    });
 
     console.log("[DO] Triggering sandbox spawn for new session");
     this.ctx.waitUntil(this.warmSandbox());
@@ -2248,18 +2104,16 @@ export class SessionDO extends DurableObject<Env> {
         "with author",
         participant.id
       );
-      this.sql.exec(
-        `INSERT INTO messages (id, author_id, content, source, attachments, callback_context, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        messageId,
-        participant.id, // Use the participant's row ID, not the user ID
-        body.content,
-        body.source,
-        body.attachments ? JSON.stringify(body.attachments) : null,
-        body.callbackContext ? JSON.stringify(body.callbackContext) : null,
-        "pending",
-        now
-      );
+      this.repository.createMessage({
+        id: messageId,
+        authorId: participant.id, // Use the participant's row ID, not the user ID
+        content: body.content,
+        source: body.source as MessageSource,
+        attachments: body.attachments ? JSON.stringify(body.attachments) : null,
+        callbackContext: body.callbackContext ? JSON.stringify(body.callbackContext) : null,
+        status: "pending",
+        createdAt: now,
+      });
 
       console.log("handleEnqueuePrompt: message inserted, processing queue");
       await this.processMessageQueue();
@@ -2284,8 +2138,7 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private handleListParticipants(): Response {
-    const result = this.sql.exec(`SELECT * FROM participants ORDER BY joined_at`);
-    const participants = result.toArray() as unknown as ParticipantRow[];
+    const participants = this.repository.listParticipants();
 
     return Response.json({
       participants: participants.map((p) => ({
@@ -2311,17 +2164,15 @@ export class SessionDO extends DurableObject<Env> {
     const id = generateId();
     const now = Date.now();
 
-    this.sql.exec(
-      `INSERT INTO participants (id, user_id, github_login, github_name, github_email, role, joined_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    this.repository.createParticipant({
       id,
-      body.userId,
-      body.githubLogin ?? null,
-      body.githubName ?? null,
-      body.githubEmail ?? null,
-      body.role ?? "member",
-      now
-    );
+      userId: body.userId,
+      githubLogin: body.githubLogin ?? null,
+      githubName: body.githubName ?? null,
+      githubEmail: body.githubEmail ?? null,
+      role: (body.role ?? "member") as ParticipantRole,
+      joinedAt: now,
+    });
 
     return Response.json({ id, status: "added" });
   }
@@ -2337,29 +2188,7 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: `Invalid event type: ${type}` }, { status: 400 });
     }
 
-    let query = `SELECT * FROM events WHERE 1=1`;
-    const params: (string | number)[] = [];
-
-    if (type) {
-      query += ` AND type = ?`;
-      params.push(type);
-    }
-
-    if (messageId) {
-      query += ` AND message_id = ?`;
-      params.push(messageId);
-    }
-
-    if (cursor) {
-      query += ` AND created_at < ?`;
-      params.push(parseInt(cursor));
-    }
-
-    query += ` ORDER BY created_at DESC LIMIT ?`;
-    params.push(limit + 1);
-
-    const result = this.sql.exec(query, ...params);
-    const events = result.toArray() as unknown as EventRow[];
+    const events = this.repository.listEvents({ cursor, limit, type, messageId });
     const hasMore = events.length > limit;
 
     if (hasMore) events.pop();
@@ -2378,8 +2207,7 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   private handleListArtifacts(): Response {
-    const result = this.sql.exec(`SELECT * FROM artifacts ORDER BY created_at DESC`);
-    const artifacts = result.toArray() as unknown as ArtifactRow[];
+    const artifacts = this.repository.listArtifacts();
 
     return Response.json({
       artifacts: artifacts.map((a) => ({
@@ -2405,24 +2233,7 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: `Invalid message status: ${status}` }, { status: 400 });
     }
 
-    let query = `SELECT * FROM messages WHERE 1=1`;
-    const params: (string | number)[] = [];
-
-    if (status) {
-      query += ` AND status = ?`;
-      params.push(status);
-    }
-
-    if (cursor) {
-      query += ` AND created_at < ?`;
-      params.push(parseInt(cursor));
-    }
-
-    query += ` ORDER BY created_at DESC LIMIT ?`;
-    params.push(limit + 1);
-
-    const result = this.sql.exec(query, ...params);
-    const messages = result.toArray() as unknown as MessageRow[];
+    const messages = this.repository.listMessages({ cursor, limit, status });
     const hasMore = messages.length > limit;
 
     if (hasMore) messages.pop();
@@ -2532,23 +2343,21 @@ export class SessionDO extends DurableObject<Env> {
       // Store the PR as an artifact
       const artifactId = generateId();
       const now = Date.now();
-      this.sql.exec(
-        `INSERT INTO artifacts (id, type, url, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        artifactId,
-        "pr",
-        prResult.htmlUrl,
-        JSON.stringify({
+      this.repository.createArtifact({
+        id: artifactId,
+        type: "pr",
+        url: prResult.htmlUrl,
+        metadata: JSON.stringify({
           number: prResult.number,
           state: prResult.state,
           head: headBranch,
           base: baseBranch,
         }),
-        now
-      );
+        createdAt: now,
+      });
 
       // Update session with branch name
-      this.sql.exec(`UPDATE session SET branch_name = ? WHERE id = ?`, headBranch, session.id);
+      this.repository.updateSessionBranch(session.id, headBranch);
 
       // Broadcast PR creation to all clients
       this.broadcast({
@@ -2608,40 +2417,29 @@ export class SessionDO extends DurableObject<Env> {
     if (participant) {
       // Update existing participant with any new info
       // Use COALESCE for token fields to only update if new values provided
-      this.sql.exec(
-        `UPDATE participants SET
-           github_user_id = COALESCE(?, github_user_id),
-           github_login = COALESCE(?, github_login),
-           github_name = COALESCE(?, github_name),
-           github_email = COALESCE(?, github_email),
-           github_access_token_encrypted = COALESCE(?, github_access_token_encrypted),
-           github_token_expires_at = COALESCE(?, github_token_expires_at)
-         WHERE id = ?`,
-        body.githubUserId ?? null,
-        body.githubLogin ?? null,
-        body.githubName ?? null,
-        body.githubEmail ?? null,
-        body.githubTokenEncrypted ?? null,
-        body.githubTokenExpiresAt ?? null,
-        participant.id
-      );
+      this.repository.updateParticipantCoalesce(participant.id, {
+        githubUserId: body.githubUserId ?? null,
+        githubLogin: body.githubLogin ?? null,
+        githubName: body.githubName ?? null,
+        githubEmail: body.githubEmail ?? null,
+        githubAccessTokenEncrypted: body.githubTokenEncrypted ?? null,
+        githubTokenExpiresAt: body.githubTokenExpiresAt ?? null,
+      });
     } else {
       // Create new participant with optional GitHub token
       const id = generateId();
-      this.sql.exec(
-        `INSERT INTO participants (id, user_id, github_user_id, github_login, github_name, github_email, github_access_token_encrypted, github_token_expires_at, role, joined_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      this.repository.createParticipant({
         id,
-        body.userId,
-        body.githubUserId ?? null,
-        body.githubLogin ?? null,
-        body.githubName ?? null,
-        body.githubEmail ?? null,
-        body.githubTokenEncrypted ?? null,
-        body.githubTokenExpiresAt ?? null,
-        "member",
-        now
-      );
+        userId: body.userId,
+        githubUserId: body.githubUserId ?? null,
+        githubLogin: body.githubLogin ?? null,
+        githubName: body.githubName ?? null,
+        githubEmail: body.githubEmail ?? null,
+        githubAccessTokenEncrypted: body.githubTokenEncrypted ?? null,
+        githubTokenExpiresAt: body.githubTokenExpiresAt ?? null,
+        role: "member",
+        joinedAt: now,
+      });
       participant = this.getParticipantByUserId(body.userId)!;
     }
 
@@ -2650,12 +2448,7 @@ export class SessionDO extends DurableObject<Env> {
     const tokenHash = await hashToken(plainToken);
 
     // Store the hash (invalidates any previous token)
-    this.sql.exec(
-      `UPDATE participants SET ws_auth_token = ?, ws_token_created_at = ? WHERE id = ?`,
-      tokenHash,
-      now,
-      participant.id
-    );
+    this.repository.updateParticipantWsToken(participant.id, tokenHash, now);
 
     console.log(`[DO] Generated WS token for participant ${participant.id} (user: ${body.userId})`);
 
@@ -2669,9 +2462,7 @@ export class SessionDO extends DurableObject<Env> {
    * Get participant by WebSocket token hash.
    */
   private getParticipantByWsTokenHash(tokenHash: string): ParticipantRow | null {
-    const result = this.sql.exec(`SELECT * FROM participants WHERE ws_auth_token = ?`, tokenHash);
-    const rows = result.toArray() as unknown as ParticipantRow[];
-    return rows[0] ?? null;
+    return this.repository.getParticipantByWsTokenHash(tokenHash);
   }
 
   /**
@@ -2703,11 +2494,7 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    this.sql.exec(
-      `UPDATE session SET status = 'archived', updated_at = ? WHERE id = ?`,
-      now,
-      session.id
-    );
+    this.repository.updateSessionStatus(session.id, "archived", now);
 
     // Broadcast status change to all connected clients
     this.broadcast({
@@ -2747,11 +2534,7 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    this.sql.exec(
-      `UPDATE session SET status = 'active', updated_at = ? WHERE id = ?`,
-      now,
-      session.id
-    );
+    this.repository.updateSessionStatus(session.id, "active", now);
 
     // Broadcast status change to all connected clients
     this.broadcast({
