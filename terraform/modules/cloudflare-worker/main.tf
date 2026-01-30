@@ -50,8 +50,6 @@ resource "cloudflare_worker" "this" {
     enabled = true
   }
 
-  logpush = true
-
   observability = {
     enabled            = true
     head_sampling_rate = 1
