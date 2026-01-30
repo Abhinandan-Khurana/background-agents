@@ -413,7 +413,9 @@ async def api_snapshot_sandbox(
                 "reason": reason,
             },
         }
-    except HTTPException:
+    except HTTPException as e:
+        outcome = "error"
+        http_status = e.status_code
         raise
     except Exception as e:
         outcome = "error"
@@ -518,7 +520,9 @@ async def api_restore_sandbox(
                 "status": handle.status.value,
             },
         }
-    except HTTPException:
+    except HTTPException as e:
+        outcome = "error"
+        http_status = e.status_code
         raise
     except Exception as e:
         outcome = "error"
