@@ -28,6 +28,7 @@ export interface SessionRow {
   opencode_session_id: string | null;
   model: string; // LLM model to use (e.g., "claude-haiku-4-5")
   status: SessionStatus;
+  vcs_provider: string; // 'github' | 'bitbucket'
   created_at: number;
   updated_at: number;
 }
@@ -40,9 +41,18 @@ export interface ParticipantRow {
   github_email: string | null;
   github_name: string | null;
   role: ParticipantRole;
+  vcs_provider: string; // 'github' | 'bitbucket'
   github_access_token_encrypted: string | null;
   github_refresh_token_encrypted: string | null;
   github_token_expires_at: number | null;
+  // Bitbucket-specific fields
+  bitbucket_access_token_encrypted: string | null;
+  bitbucket_refresh_token_encrypted: string | null;
+  bitbucket_token_expires_at: number | null;
+  bitbucket_uuid: string | null;
+  bitbucket_login: string | null;
+  bitbucket_email: string | null;
+  bitbucket_display_name: string | null;
   ws_auth_token: string | null; // SHA-256 hash of WebSocket auth token
   ws_token_created_at: number | null; // When the token was generated
   joined_at: number;
@@ -102,8 +112,16 @@ export interface PromptCommand {
   model?: string; // LLM model for per-message override
   author: {
     userId: string;
-    githubName: string | null;
-    githubEmail: string | null;
+    vcsProvider?: "github" | "bitbucket";
+    // GitHub fields
+    githubName?: string | null;
+    githubEmail?: string | null;
+    githubToken?: string;
+    // Bitbucket fields
+    bitbucketDisplayName?: string | null;
+    bitbucketName?: string | null;
+    bitbucketEmail?: string | null;
+    bitbucketToken?: string;
   };
   attachments?: Array<{
     type: string;
@@ -111,6 +129,16 @@ export interface PromptCommand {
     url?: string;
     content?: string;
   }>;
+}
+
+export interface PushCommand {
+  type: "push";
+  branchName: string;
+  repoOwner: string;
+  repoName: string;
+  vcsProvider?: "github" | "bitbucket";
+  githubToken?: string;
+  bitbucketToken?: string;
 }
 
 export interface StopCommand {
@@ -125,7 +153,12 @@ export interface ShutdownCommand {
   type: "shutdown";
 }
 
-export type SandboxCommand = PromptCommand | StopCommand | SnapshotCommand | ShutdownCommand;
+export type SandboxCommand =
+  | PromptCommand
+  | PushCommand
+  | StopCommand
+  | SnapshotCommand
+  | ShutdownCommand;
 
 // Internal session update types
 

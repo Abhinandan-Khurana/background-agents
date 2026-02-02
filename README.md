@@ -35,6 +35,7 @@ The system uses a shared GitHub App installation for all git operations (clone, 
 | Token Type       | Purpose                | Scope                            |
 | ---------------- | ---------------------- | -------------------------------- |
 | GitHub App Token | Clone repos, push code | All repos where App is installed |
+| Bitbucket App Password | Clone repos, push code | Repos accessible to Bot account |
 | User OAuth Token | Create PRs, user info  | Repos user has access to         |
 | WebSocket Token  | Real-time session auth | Single session                   |
 
@@ -46,7 +47,7 @@ built for internal use where all employees are trusted and have access to compan
 
 **For multi-tenant deployment**, you would need:
 
-- Per-tenant GitHub App installations
+- Per-tenant GitHub App installations or Bitbucket Consumers
 - Access validation at session creation
 - Tenant isolation in the data model
 

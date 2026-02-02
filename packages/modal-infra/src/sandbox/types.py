@@ -118,3 +118,4 @@ class SessionConfig(BaseModel):
     provider: str = "anthropic"
     model: str = "claude-sonnet-4-5"
     git_user: GitUser | None = None
+    vcs_provider: str = "github"  # 'github' or 'bitbucket'

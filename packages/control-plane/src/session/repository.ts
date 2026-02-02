@@ -21,6 +21,7 @@ import type {
   MessageSource,
   ParticipantRole,
   ArtifactType,
+  VCSProvider,
 } from "../types";
 
 /**
@@ -86,12 +87,22 @@ export interface CreateSandboxData {
 export interface CreateParticipantData {
   id: string;
   userId: string;
+  vcsProvider?: VCSProvider;
+  // GitHub fields
   githubUserId?: string | null;
   githubLogin?: string | null;
   githubName?: string | null;
   githubEmail?: string | null;
   githubAccessTokenEncrypted?: string | null;
   githubTokenExpiresAt?: number | null;
+  // Bitbucket fields
+  bitbucketUuid?: string | null;
+  bitbucketLogin?: string | null;
+  bitbucketDisplayName?: string | null;
+  bitbucketEmail?: string | null;
+  bitbucketAccessTokenEncrypted?: string | null;
+  bitbucketRefreshTokenEncrypted?: string | null;
+  bitbucketTokenExpiresAt?: number | null;
   role: ParticipantRole;
   joinedAt: number;
 }
@@ -100,12 +111,22 @@ export interface CreateParticipantData {
  * Data for updating a participant with COALESCE (only non-null values update).
  */
 export interface UpdateParticipantData {
+  vcsProvider?: VCSProvider;
+  // GitHub fields
   githubUserId?: string | null;
   githubLogin?: string | null;
   githubName?: string | null;
   githubEmail?: string | null;
   githubAccessTokenEncrypted?: string | null;
   githubTokenExpiresAt?: number | null;
+  // Bitbucket fields
+  bitbucketUuid?: string | null;
+  bitbucketLogin?: string | null;
+  bitbucketDisplayName?: string | null;
+  bitbucketEmail?: string | null;
+  bitbucketAccessTokenEncrypted?: string | null;
+  bitbucketRefreshTokenEncrypted?: string | null;
+  bitbucketTokenExpiresAt?: number | null;
 }
 
 /**
@@ -371,16 +392,29 @@ export class SessionRepository {
 
   createParticipant(data: CreateParticipantData): void {
     this.sql.exec(
-      `INSERT INTO participants (id, user_id, github_user_id, github_login, github_name, github_email, github_access_token_encrypted, github_token_expires_at, role, joined_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO participants (
+        id, user_id, vcs_provider,
+        github_user_id, github_login, github_name, github_email, github_access_token_encrypted, github_token_expires_at,
+        bitbucket_uuid, bitbucket_login, bitbucket_display_name, bitbucket_email, bitbucket_access_token_encrypted, bitbucket_refresh_token_encrypted, bitbucket_token_expires_at,
+        role, joined_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       data.id,
       data.userId,
+      data.vcsProvider ?? "github",
       data.githubUserId ?? null,
       data.githubLogin ?? null,
       data.githubName ?? null,
       data.githubEmail ?? null,
       data.githubAccessTokenEncrypted ?? null,
       data.githubTokenExpiresAt ?? null,
+      data.bitbucketUuid ?? null,
+      data.bitbucketLogin ?? null,
+      data.bitbucketDisplayName ?? null,
+      data.bitbucketEmail ?? null,
+      data.bitbucketAccessTokenEncrypted ?? null,
+      data.bitbucketRefreshTokenEncrypted ?? null,
+      data.bitbucketTokenExpiresAt ?? null,
       data.role,
       data.joinedAt
     );
@@ -389,19 +423,35 @@ export class SessionRepository {
   updateParticipantCoalesce(participantId: string, data: UpdateParticipantData): void {
     this.sql.exec(
       `UPDATE participants SET
+         vcs_provider = COALESCE(?, vcs_provider),
          github_user_id = COALESCE(?, github_user_id),
          github_login = COALESCE(?, github_login),
          github_name = COALESCE(?, github_name),
          github_email = COALESCE(?, github_email),
          github_access_token_encrypted = COALESCE(?, github_access_token_encrypted),
-         github_token_expires_at = COALESCE(?, github_token_expires_at)
+         github_token_expires_at = COALESCE(?, github_token_expires_at),
+         bitbucket_uuid = COALESCE(?, bitbucket_uuid),
+         bitbucket_login = COALESCE(?, bitbucket_login),
+         bitbucket_display_name = COALESCE(?, bitbucket_display_name),
+         bitbucket_email = COALESCE(?, bitbucket_email),
+         bitbucket_access_token_encrypted = COALESCE(?, bitbucket_access_token_encrypted),
+         bitbucket_refresh_token_encrypted = COALESCE(?, bitbucket_refresh_token_encrypted),
+         bitbucket_token_expires_at = COALESCE(?, bitbucket_token_expires_at)
        WHERE id = ?`,
+      data.vcsProvider ?? null,
       data.githubUserId ?? null,
       data.githubLogin ?? null,
       data.githubName ?? null,
       data.githubEmail ?? null,
       data.githubAccessTokenEncrypted ?? null,
       data.githubTokenExpiresAt ?? null,
+      data.bitbucketUuid ?? null,
+      data.bitbucketLogin ?? null,
+      data.bitbucketDisplayName ?? null,
+      data.bitbucketEmail ?? null,
+      data.bitbucketAccessTokenEncrypted ?? null,
+      data.bitbucketRefreshTokenEncrypted ?? null,
+      data.bitbucketTokenExpiresAt ?? null,
       participantId
     );
   }

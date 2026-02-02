@@ -6,6 +6,8 @@ import type { Env, CreateSessionRequest, CreateSessionResponse } from "./types";
 import { generateId, encryptToken } from "./auth/crypto";
 import { verifyInternalToken } from "./auth/internal";
 import { getGitHubAppConfig, listInstallationRepositories } from "./auth/github-app";
+import { listBitbucketRepos, getValidAccessToken as getValidBitbucketToken } from "./auth/bitbucket";
+import type { VCSProvider } from "./types";
 import type {
   EnrichedRepository,
   InstallationRepository,
@@ -489,11 +491,22 @@ async function handleCreateSession(
   const body = (await request.json()) as CreateSessionRequest & {
     // Optional GitHub token for PR creation (will be encrypted and stored)
     githubToken?: string;
+    // Optional Bitbucket token for PR creation (will be encrypted and stored)
+    bitbucketToken?: string;
+    bitbucketRefreshToken?: string;
+    bitbucketTokenExpiresAt?: number;
+    // VCS provider
+    vcsProvider?: VCSProvider;
     // User info
     userId?: string;
     githubLogin?: string;
     githubName?: string;
     githubEmail?: string;
+    // Bitbucket user info
+    bitbucketUuid?: string;
+    bitbucketLogin?: string;
+    bitbucketDisplayName?: string;
+    bitbucketEmail?: string;
   };
 
   if (!body.repoOwner || !body.repoName) {
@@ -504,12 +517,24 @@ async function handleCreateSession(
   const repoOwner = body.repoOwner.toLowerCase();
   const repoName = body.repoName.toLowerCase();
 
+  // VCS provider (default to github for backwards compatibility)
+  const vcsProvider: VCSProvider = body.vcsProvider || "github";
+
   // User info from direct params
   const userId = body.userId || "anonymous";
   const githubLogin = body.githubLogin;
   const githubName = body.githubName;
   const githubEmail = body.githubEmail;
   let githubTokenEncrypted: string | null = null;
+
+  // Bitbucket user info
+  const bitbucketUuid = body.bitbucketUuid;
+  const bitbucketLogin = body.bitbucketLogin;
+  const bitbucketDisplayName = body.bitbucketDisplayName;
+  const bitbucketEmail = body.bitbucketEmail;
+  let bitbucketTokenEncrypted: string | null = null;
+  let bitbucketRefreshTokenEncrypted: string | null = null;
+  const bitbucketTokenExpiresAt = body.bitbucketTokenExpiresAt || null;
 
   // If GitHub token provided, encrypt it
   if (body.githubToken && env.TOKEN_ENCRYPTION_KEY) {
@@ -520,6 +545,24 @@ async function handleCreateSession(
         error: e instanceof Error ? e : String(e),
       });
       return error("Failed to process GitHub token", 500);
+    }
+  }
+
+  // If Bitbucket tokens provided, encrypt them
+  if (body.bitbucketToken && env.TOKEN_ENCRYPTION_KEY) {
+    try {
+      bitbucketTokenEncrypted = await encryptToken(body.bitbucketToken, env.TOKEN_ENCRYPTION_KEY);
+      if (body.bitbucketRefreshToken) {
+        bitbucketRefreshTokenEncrypted = await encryptToken(
+          body.bitbucketRefreshToken,
+          env.TOKEN_ENCRYPTION_KEY
+        );
+      }
+    } catch (e) {
+      logger.error("Failed to encrypt Bitbucket token", {
+        error: e instanceof Error ? e : String(e),
+      });
+      return error("Failed to process Bitbucket token", 500);
     }
   }
 
@@ -543,11 +586,21 @@ async function handleCreateSession(
           repoName,
           title: body.title,
           model: body.model || "claude-haiku-4-5", // Default to haiku for cost efficiency
+          vcsProvider,
+          // GitHub user info
           userId,
           githubLogin,
           githubName,
           githubEmail,
           githubTokenEncrypted, // Pass encrypted token to store with owner
+          // Bitbucket user info
+          bitbucketUuid,
+          bitbucketLogin,
+          bitbucketDisplayName,
+          bitbucketEmail,
+          bitbucketTokenEncrypted,
+          bitbucketRefreshTokenEncrypted,
+          bitbucketTokenExpiresAt,
         }),
       },
       ctx
@@ -568,6 +621,7 @@ async function handleCreateSession(
       repoOwner,
       repoName,
       model: body.model || "claude-haiku-4-5",
+      vcsProvider,
       status: "created",
       createdAt: now,
       updatedAt: now,
@@ -994,8 +1048,11 @@ interface CachedReposList {
 }
 
 /**
- * List all repositories accessible via the GitHub App installation.
+ * List all repositories accessible via the GitHub App installation or Bitbucket user token.
  * Results are cached in KV for 5 minutes to avoid rate limits.
+ *
+ * For GitHub: Uses GitHub App installation token
+ * For Bitbucket: Uses user's OAuth token from X-User-Token header
  */
 async function handleListRepos(
   request: Request,
@@ -1003,7 +1060,12 @@ async function handleListRepos(
   _match: RegExpMatchArray,
   _ctx: RequestContext
 ): Promise<Response> {
-  const CACHE_KEY = "repos:list";
+  // Determine VCS provider from header
+  const vcsProvider = (request.headers.get("X-VCS-Provider") || "github") as VCSProvider;
+  const userToken = request.headers.get("X-User-Token");
+
+  // Use provider-specific cache keys
+  const CACHE_KEY = vcsProvider === "bitbucket" ? "repos:list:bitbucket" : "repos:list";
   const CACHE_TTL = 300; // 5 minutes
 
   // Check KV cache first
@@ -1020,7 +1082,52 @@ async function handleListRepos(
     logger.warn("Failed to read repos cache", { error: e instanceof Error ? e : String(e) });
   }
 
-  // Get GitHub App config
+  // Handle Bitbucket repository listing
+  if (vcsProvider === "bitbucket") {
+    if (!userToken) {
+      return error("Bitbucket access token required (X-User-Token header)", 401);
+    }
+
+    try {
+      const bitbucketRepos = await listBitbucketRepos(userToken);
+
+      // Normalize Bitbucket repos to match the EnrichedRepository interface
+      const repos: EnrichedRepository[] = bitbucketRepos.map((repo) => ({
+        id: repo.uuid,
+        owner: repo.workspace?.slug || repo.owner?.username || "",
+        name: repo.slug,
+        fullName: repo.full_name,
+        description: repo.description || null,
+        private: repo.is_private,
+        defaultBranch: repo.mainbranch?.name || "main",
+      }));
+
+      // Cache the results
+      const cachedAt = new Date().toISOString();
+      const cacheData: CachedReposList = { repos, cachedAt };
+
+      try {
+        await env.SESSION_INDEX.put(CACHE_KEY, JSON.stringify(cacheData), {
+          expirationTtl: CACHE_TTL,
+        });
+      } catch (e) {
+        logger.warn("Failed to cache Bitbucket repos list", { error: e instanceof Error ? e : String(e) });
+      }
+
+      return json({
+        repos,
+        cached: false,
+        cachedAt,
+      });
+    } catch (e) {
+      logger.error("Failed to list Bitbucket repositories", {
+        error: e instanceof Error ? e : String(e),
+      });
+      return error("Failed to fetch repositories from Bitbucket", 500);
+    }
+  }
+
+  // GitHub: Use GitHub App installation
   const appConfig = getGitHubAppConfig(env);
   if (!appConfig) {
     return error("GitHub App not configured", 500);

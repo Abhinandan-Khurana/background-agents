@@ -39,6 +39,14 @@ class TokenResolution(NamedTuple):
     source: str
 
 
+class VCSCredentials(NamedTuple):
+    """VCS authentication credentials."""
+
+    username: str
+    token: str
+    source: str  # For logging: "bot", "command", "env", "none"
+
+
 class OpenCodeIdentifier:
     """
     Generate OpenCode-compatible ascending IDs.
@@ -453,13 +461,20 @@ class AgentBridge:
             model=model,
         )
 
-        github_name = author_data.get("githubName")
-        github_email = author_data.get("githubEmail")
-        if github_name and github_email:
+        # Configure git identity based on VCS provider
+        vcs_provider = author_data.get("vcsProvider", "github")
+        if vcs_provider == "bitbucket":
+            git_name = author_data.get("bitbucketDisplayName") or author_data.get("bitbucketName")
+            git_email = author_data.get("bitbucketEmail")
+        else:
+            git_name = author_data.get("githubName")
+            git_email = author_data.get("githubEmail")
+
+        if git_name and git_email:
             await self._configure_git_identity(
                 GitUser(
-                    name=github_name,
-                    email=github_email,
+                    name=git_name,
+                    email=git_email,
                 )
             )
 
@@ -1064,19 +1079,72 @@ class AgentBridge:
         else:
             return TokenResolution("", "none")
 
+    def _resolve_vcs_credentials(self, cmd: dict[str, Any]) -> VCSCredentials:
+        """Resolve VCS credentials based on provider.
+
+        For Bitbucket:
+            - PREFERRED: System Bot credentials (BITBUCKET_BOT_USERNAME + BITBUCKET_BOT_APP_PASSWORD)
+                         for stability - OAuth tokens expire after 1 hour.
+            - FALLBACK: User OAuth token from command (x-token-auth as username).
+
+        For GitHub:
+            - Fresh app token from command (just-in-time from control plane)
+            - Startup app token from env (may be expired for long sessions)
+
+        Returns:
+            VCSCredentials with username, token, and source for logging.
+        """
+        vcs_provider = cmd.get("vcsProvider", "github")
+
+        if vcs_provider == "bitbucket":
+            # Prefer System Bot credentials for stability
+            bot_username = os.environ.get("BITBUCKET_BOT_USERNAME")
+            bot_password = os.environ.get("BITBUCKET_BOT_APP_PASSWORD")
+            if bot_username and bot_password:
+                return VCSCredentials(bot_username, bot_password, "bot")
+
+            # Fallback to user OAuth token (may expire during long sessions)
+            if cmd.get("bitbucketToken"):
+                return VCSCredentials("x-token-auth", cmd["bitbucketToken"], "user_oauth")
+
+            return VCSCredentials("", "", "none")
+
+        # GitHub: use x-access-token pattern
+        github_token, token_source = self._resolve_github_token(cmd)
+        return VCSCredentials("x-access-token", github_token, token_source)
+
+    def _get_git_remote_url(
+        self, vcs_provider: str, creds: VCSCredentials, repo_owner: str, repo_name: str
+    ) -> str:
+        """Construct git remote URL based on VCS provider.
+
+        Format:
+            - Bitbucket: https://<user>:<token>@bitbucket.org/<workspace>/<repo>.git
+            - GitHub:    https://x-access-token:<token>@github.com/<owner>/<repo>.git
+        """
+        if vcs_provider == "bitbucket":
+            return f"https://{creds.username}:{creds.token}@bitbucket.org/{repo_owner}/{repo_name}.git"
+        else:
+            return f"https://{creds.username}:{creds.token}@github.com/{repo_owner}/{repo_name}.git"
+
     async def _handle_push(self, cmd: dict[str, Any]) -> None:
-        """Handle push command - push current branch to GitHub."""
+        """Handle push command - push current branch to remote.
+
+        Supports both GitHub and Bitbucket based on vcsProvider.
+        """
         branch_name = cmd.get("branchName", "")
         repo_owner = cmd.get("repoOwner") or os.environ.get("REPO_OWNER", "")
         repo_name = cmd.get("repoName") or os.environ.get("REPO_NAME", "")
+        vcs_provider = cmd.get("vcsProvider", "github")
 
-        github_token, token_source = self._resolve_github_token(cmd)
+        vcs_creds = self._resolve_vcs_credentials(cmd)
         self.log.info(
             "git.push_start",
             branch_name=branch_name,
             repo_owner=repo_owner,
             repo_name=repo_name,
-            token_source=token_source,
+            vcs_provider=vcs_provider,
+            creds_source=vcs_creds.source,
         )
 
         repo_dirs = list(self.repo_path.glob("*/.git"))
@@ -1095,20 +1163,19 @@ class AgentBridge:
         try:
             refspec = f"HEAD:refs/heads/{branch_name}"
 
-            if not github_token or not repo_owner or not repo_name:
-                self.log.warn("git.push_error", reason="missing_credentials")
+            if not vcs_creds.token or not repo_owner or not repo_name:
+                provider_name = "Bitbucket" if vcs_provider == "bitbucket" else "GitHub"
+                self.log.warn("git.push_error", reason="missing_credentials", vcs_provider=vcs_provider)
                 await self._send_event(
                     {
                         "type": "push_error",
-                        "error": "Push failed - GitHub authentication token is required",
+                        "error": f"Push failed - {provider_name} authentication token is required",
                         "branchName": branch_name,
                     }
                 )
                 return
 
-            push_url = (
-                f"https://x-access-token:{github_token}@github.com/{repo_owner}/{repo_name}.git"
-            )
+            push_url = self._get_git_remote_url(vcs_provider, vcs_creds, repo_owner, repo_name)
 
             result = await asyncio.create_subprocess_exec(
                 "git",
@@ -1124,7 +1191,7 @@ class AgentBridge:
             _stdout, _stderr = await result.communicate()
 
             if result.returncode != 0:
-                self.log.warn("git.push_failed", branch_name=branch_name)
+                self.log.warn("git.push_failed", branch_name=branch_name, vcs_provider=vcs_provider)
                 await self._send_event(
                     {
                         "type": "push_error",
@@ -1133,7 +1200,7 @@ class AgentBridge:
                     }
                 )
             else:
-                self.log.info("git.push_complete", branch_name=branch_name)
+                self.log.info("git.push_complete", branch_name=branch_name, vcs_provider=vcs_provider)
                 await self._send_event(
                     {
                         "type": "push_complete",
@@ -1142,7 +1209,7 @@ class AgentBridge:
                 )
 
         except Exception as e:
-            self.log.error("git.push_error", exc=e, branch_name=branch_name)
+            self.log.error("git.push_error", exc=e, branch_name=branch_name, vcs_provider=vcs_provider)
             await self._send_event(
                 {
                     "type": "push_error",

@@ -104,7 +104,8 @@ async def api_create_sandbox(
         "git_user_name": null,
         "git_user_email": null,
         "provider": "anthropic",
-        "model": "claude-sonnet-4-5"
+        "model": "claude-sonnet-4-5",
+        "vcs_provider": "github"  // 'github' or 'bitbucket'
     }
     """
     start_time = time.time()
@@ -124,21 +125,35 @@ async def api_create_sandbox(
 
         manager = SandboxManager()
 
-        # Generate GitHub App token for git operations
-        github_app_token = None
-        try:
-            app_id = os.environ.get("GITHUB_APP_ID")
-            private_key = os.environ.get("GITHUB_APP_PRIVATE_KEY")
-            installation_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
+        # Determine VCS provider
+        vcs_provider = request.get("vcs_provider", "github")
 
-            if app_id and private_key and installation_id:
-                github_app_token = generate_installation_token(
-                    app_id=app_id,
-                    private_key=private_key,
-                    installation_id=installation_id,
-                )
-        except Exception as e:
-            log.warn("github.token_error", exc=e)
+        # Generate appropriate git token based on VCS provider
+        github_app_token = None
+        bitbucket_bot_username = None
+        bitbucket_bot_app_password = None
+
+        if vcs_provider == "bitbucket":
+            # For Bitbucket, use bot credentials from environment
+            bitbucket_bot_username = os.environ.get("BITBUCKET_BOT_USERNAME")
+            bitbucket_bot_app_password = os.environ.get("BITBUCKET_BOT_APP_PASSWORD")
+            if not bitbucket_bot_username or not bitbucket_bot_app_password:
+                log.warn("bitbucket.bot_credentials_missing")
+        else:
+            # For GitHub, generate App installation token
+            try:
+                app_id = os.environ.get("GITHUB_APP_ID")
+                private_key = os.environ.get("GITHUB_APP_PRIVATE_KEY")
+                installation_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
+
+                if app_id and private_key and installation_id:
+                    github_app_token = generate_installation_token(
+                        app_id=app_id,
+                        private_key=private_key,
+                        installation_id=installation_id,
+                    )
+            except Exception as e:
+                log.warn("github.token_error", exc=e)
 
         # Build session config
         git_user = None
@@ -155,6 +170,7 @@ async def api_create_sandbox(
             provider=request.get("provider", "anthropic"),
             model=request.get("model", "claude-sonnet-4-5"),
             git_user=git_user,
+            vcs_provider=vcs_provider,
         )
 
         config = SandboxConfig(
@@ -166,6 +182,9 @@ async def api_create_sandbox(
             control_plane_url=control_plane_url,
             sandbox_auth_token=request.get("sandbox_auth_token"),
             github_app_token=github_app_token,
+            vcs_provider=vcs_provider,
+            bitbucket_bot_username=bitbucket_bot_username,
+            bitbucket_bot_app_password=bitbucket_bot_app_password,
         )
 
         handle = await manager.create_sandbox(config)

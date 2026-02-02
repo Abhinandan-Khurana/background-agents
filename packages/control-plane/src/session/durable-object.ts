@@ -11,6 +11,11 @@ import { DurableObject } from "cloudflare:workers";
 import { initSchema } from "./schema";
 import { generateId, decryptToken, hashToken } from "../auth/crypto";
 import { generateInstallationToken, getGitHubAppConfig } from "../auth/github-app";
+import {
+  createBitbucketPR,
+  getBitbucketRepository,
+  getValidAccessTokenForPR as getValidBitbucketToken,
+} from "../auth/bitbucket";
 import { createModalClient } from "../sandbox/client";
 import { createModalProvider } from "../sandbox/providers/modal-provider";
 import { createLogger, parseLogLevel } from "../logger";
@@ -38,6 +43,7 @@ import type {
   SandboxStatus,
   MessageSource,
   ParticipantRole,
+  VCSProvider,
 } from "../types";
 import type { SessionRow, ParticipantRow, EventRow, SandboxRow, SandboxCommand } from "./types";
 import { SessionRepository, type MessageWithParticipant } from "./repository";
@@ -1131,7 +1137,11 @@ export class SessionDO extends DurableObject<Env> {
     branchName: string,
     repoOwner: string,
     repoName: string,
-    githubToken?: string
+    options?: {
+      githubToken?: string;
+      vcsProvider?: VCSProvider;
+      bitbucketToken?: string;
+    }
   ): Promise<{ success: true } | { success: false; error: string }> {
     const sandboxWs = this.getSandboxWebSocket();
 
@@ -1159,15 +1169,18 @@ export class SessionDO extends DurableObject<Env> {
     });
 
     // Tell sandbox to push the current branch
-    // Pass GitHub App token for authentication (sandbox uses for git push)
+    // Pass token for authentication (sandbox uses for git push)
     // User's OAuth token is NOT sent to sandbox - only used server-side for PR API
-    this.log.info("Sending push command", { branch_name: branchName });
+    const vcsProvider = options?.vcsProvider || "github";
+    this.log.info("Sending push command", { branch_name: branchName, vcs_provider: vcsProvider });
     this.safeSend(sandboxWs, {
       type: "push",
       branchName,
       repoOwner,
       repoName,
-      githubToken,
+      vcsProvider,
+      githubToken: options?.githubToken,
+      bitbucketToken: options?.bitbucketToken,
     });
 
     // Wait for push_complete or push_error event
@@ -2008,9 +2021,9 @@ export class SessionDO extends DurableObject<Env> {
 
   /**
    * Handle PR creation request.
-   * 1. Get prompting user's GitHub token (required, no fallback)
+   * 1. Get prompting user's token (GitHub or Bitbucket based on vcs_provider)
    * 2. Send push command to sandbox
-   * 3. Create PR using GitHub API
+   * 3. Create PR using appropriate API
    */
   private async handleCreatePR(request: Request): Promise<Response> {
     const body = (await request.json()) as {
@@ -2024,114 +2037,29 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: "Session not found" }, { status: 404 });
     }
 
+    // Determine VCS provider
+    const vcsProvider: VCSProvider = (session.vcs_provider as VCSProvider) || "github";
+
     // Get the prompting user who will create the PR
     const promptingUser = await this.getPromptingUserForPR();
     if (!promptingUser.user) {
       return Response.json({ error: promptingUser.error }, { status: promptingUser.status });
     }
 
-    this.log.info("Creating PR", { user_id: promptingUser.user.user_id });
+    this.log.info("Creating PR", { user_id: promptingUser.user.user_id, vcs_provider: vcsProvider });
 
     const user = promptingUser.user;
 
     try {
-      // Decrypt the prompting user's GitHub token
-      const accessToken = await decryptToken(
-        user.github_access_token_encrypted!,
-        this.env.TOKEN_ENCRYPTION_KEY
-      );
-
-      // Get repository info to determine default branch
-      const repoInfo = await getRepository(accessToken, session.repo_owner, session.repo_name);
-
-      const baseBranch = body.baseBranch || repoInfo.defaultBranch;
-      const sessionId = session.session_name || session.id;
-      const headBranch = generateBranchName(sessionId);
-
-      // Generate GitHub App token for push (not user token)
-      // User token is only used for PR API call below
-      let pushToken: string | undefined;
-      const appConfig = getGitHubAppConfig(this.env);
-      if (appConfig) {
-        try {
-          pushToken = await generateInstallationToken(appConfig);
-          this.log.info("Generated fresh GitHub App token for push");
-        } catch (err) {
-          this.log.error("Failed to generate app token, push may fail", {
-            error: err instanceof Error ? err : String(err),
-          });
-        }
+      if (vcsProvider === "bitbucket") {
+        return await this.handleCreateBitbucketPR(session, user, body);
+      } else {
+        return await this.handleCreateGitHubPR(session, user, body);
       }
-
-      // Push branch to remote via sandbox
-      const pushResult = await this.pushBranchToRemote(
-        headBranch,
-        session.repo_owner,
-        session.repo_name,
-        pushToken
-      );
-
-      if (!pushResult.success) {
-        return Response.json({ error: pushResult.error }, { status: 500 });
-      }
-
-      // Append session link footer to agent's PR body
-      const webAppUrl = this.env.WEB_APP_URL || this.env.WORKER_URL || "";
-      const sessionUrl = `${webAppUrl}/session/${sessionId}`;
-      const fullBody = body.body + `\n\n---\n*Created with [Open-Inspect](${sessionUrl})*`;
-
-      // Create the PR using GitHub API (using the prompting user's token)
-      const prResult = await createPullRequest(
-        {
-          accessTokenEncrypted: user.github_access_token_encrypted!,
-          owner: session.repo_owner,
-          repo: session.repo_name,
-          title: body.title,
-          body: fullBody,
-          head: headBranch,
-          base: baseBranch,
-        },
-        this.env.TOKEN_ENCRYPTION_KEY
-      );
-
-      // Store the PR as an artifact
-      const artifactId = generateId();
-      const now = Date.now();
-      this.repository.createArtifact({
-        id: artifactId,
-        type: "pr",
-        url: prResult.htmlUrl,
-        metadata: JSON.stringify({
-          number: prResult.number,
-          state: prResult.state,
-          head: headBranch,
-          base: baseBranch,
-        }),
-        createdAt: now,
-      });
-
-      // Update session with branch name
-      this.repository.updateSessionBranch(session.id, headBranch);
-
-      // Broadcast PR creation to all clients
-      this.broadcast({
-        type: "artifact_created",
-        artifact: {
-          id: artifactId,
-          type: "pr",
-          url: prResult.htmlUrl,
-          prNumber: prResult.number,
-        },
-      });
-
-      return Response.json({
-        prNumber: prResult.number,
-        prUrl: prResult.htmlUrl,
-        state: prResult.state,
-      });
     } catch (error) {
       this.log.error("PR creation failed", {
         error: error instanceof Error ? error : String(error),
+        vcs_provider: vcsProvider,
       });
       return Response.json(
         { error: error instanceof Error ? error.message : "Failed to create PR" },
@@ -2141,24 +2069,224 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   /**
+   * Create a PR on GitHub.
+   */
+  private async handleCreateGitHubPR(
+    session: SessionRow,
+    user: ParticipantRow,
+    body: { title: string; body: string; baseBranch?: string }
+  ): Promise<Response> {
+    // Decrypt the prompting user's GitHub token
+    const accessToken = await decryptToken(
+      user.github_access_token_encrypted!,
+      this.env.TOKEN_ENCRYPTION_KEY
+    );
+
+    // Get repository info to determine default branch
+    const repoInfo = await getRepository(accessToken, session.repo_owner, session.repo_name);
+
+    const baseBranch = body.baseBranch || repoInfo.defaultBranch;
+    const sessionId = session.session_name || session.id;
+    const headBranch = generateBranchName(sessionId);
+
+    // Generate GitHub App token for push (not user token)
+    // User token is only used for PR API call below
+    let pushToken: string | undefined;
+    const appConfig = getGitHubAppConfig(this.env);
+    if (appConfig) {
+      try {
+        pushToken = await generateInstallationToken(appConfig);
+        this.log.info("Generated fresh GitHub App token for push");
+      } catch (err) {
+        this.log.error("Failed to generate app token, push may fail", {
+          error: err instanceof Error ? err : String(err),
+        });
+      }
+    }
+
+    // Push branch to remote via sandbox
+    const pushResult = await this.pushBranchToRemote(
+      headBranch,
+      session.repo_owner,
+      session.repo_name,
+      { githubToken: pushToken, vcsProvider: "github" }
+    );
+
+    if (!pushResult.success) {
+      return Response.json({ error: pushResult.error }, { status: 500 });
+    }
+
+    // Append session link footer to agent's PR body
+    const webAppUrl = this.env.WEB_APP_URL || this.env.WORKER_URL || "";
+    const sessionUrl = `${webAppUrl}/session/${sessionId}`;
+    const fullBody = body.body + `\n\n---\n*Created with [Open-Inspect](${sessionUrl})*`;
+
+    // Create the PR using GitHub API (using the prompting user's token)
+    const prResult = await createPullRequest(
+      {
+        accessTokenEncrypted: user.github_access_token_encrypted!,
+        owner: session.repo_owner,
+        repo: session.repo_name,
+        title: body.title,
+        body: fullBody,
+        head: headBranch,
+        base: baseBranch,
+      },
+      this.env.TOKEN_ENCRYPTION_KEY
+    );
+
+    // Store and broadcast artifact
+    return this.storePRArtifact(prResult.htmlUrl, prResult.number, prResult.state, headBranch, baseBranch, sessionId);
+  }
+
+  /**
+   * Create a PR on Bitbucket.
+   */
+  private async handleCreateBitbucketPR(
+    session: SessionRow,
+    user: ParticipantRow,
+    body: { title: string; body: string; baseBranch?: string }
+  ): Promise<Response> {
+    // Get valid Bitbucket token (refresh if needed)
+    if (!user.bitbucket_access_token_encrypted) {
+      return Response.json({ error: "No Bitbucket token available for PR creation" }, { status: 401 });
+    }
+
+    const accessToken = await getValidBitbucketToken(
+      {
+        accessTokenEncrypted: user.bitbucket_access_token_encrypted,
+        refreshTokenEncrypted: user.bitbucket_refresh_token_encrypted || null,
+        expiresAt: user.bitbucket_token_expires_at || null,
+      },
+      this.env,
+      user.id,
+      this.repository
+    );
+
+    // Get repository info to determine default branch
+    const repoInfo = await getBitbucketRepository(accessToken, session.repo_owner, session.repo_name);
+
+    const baseBranch = body.baseBranch || repoInfo.mainbranch?.name || "main";
+    const sessionId = session.session_name || session.id;
+    const headBranch = generateBranchName(sessionId);
+
+    // Push branch to remote via sandbox
+    // For Bitbucket, the sandbox will use bot credentials from env (preferred) or we can pass user token
+    const pushResult = await this.pushBranchToRemote(
+      headBranch,
+      session.repo_owner,
+      session.repo_name,
+      { vcsProvider: "bitbucket" }
+      // Note: Bot credentials are in sandbox env, no need to pass token
+    );
+
+    if (!pushResult.success) {
+      return Response.json({ error: pushResult.error }, { status: 500 });
+    }
+
+    // Append session link footer to agent's PR body
+    const webAppUrl = this.env.WEB_APP_URL || this.env.WORKER_URL || "";
+    const sessionUrl = `${webAppUrl}/session/${sessionId}`;
+    const fullBody = body.body + `\n\n---\n*Created with [Open-Inspect](${sessionUrl})*`;
+
+    // Create the PR using Bitbucket API (using the prompting user's token)
+    const prResult = await createBitbucketPR(
+      accessToken,
+      session.repo_owner,  // workspace
+      session.repo_name,   // repo slug
+      {
+        title: body.title,
+        body: fullBody,
+        sourceBranch: headBranch,
+        destinationBranch: baseBranch,
+      }
+    );
+
+    // Store and broadcast artifact
+    // Bitbucket PR response has different structure
+    const prUrl = prResult.links?.html?.href || `https://bitbucket.org/${session.repo_owner}/${session.repo_name}/pull-requests/${prResult.id}`;
+    return this.storePRArtifact(prUrl, prResult.id, prResult.state || "OPEN", headBranch, baseBranch, sessionId);
+  }
+
+  /**
+   * Store PR artifact and broadcast to clients.
+   */
+  private storePRArtifact(
+    prUrl: string,
+    prNumber: number,
+    prState: string,
+    headBranch: string,
+    baseBranch: string,
+    sessionId: string
+  ): Response {
+    const artifactId = generateId();
+    const now = Date.now();
+    this.repository.createArtifact({
+      id: artifactId,
+      type: "pr",
+      url: prUrl,
+      metadata: JSON.stringify({
+        number: prNumber,
+        state: prState,
+        head: headBranch,
+        base: baseBranch,
+      }),
+      createdAt: now,
+    });
+
+    // Update session with branch name
+    const session = this.getSession();
+    if (session) {
+      this.repository.updateSessionBranch(session.id, headBranch);
+    }
+
+    // Broadcast PR creation to all clients
+    this.broadcast({
+      type: "artifact_created",
+      artifact: {
+        id: artifactId,
+        type: "pr",
+        url: prUrl,
+        prNumber: prNumber,
+      },
+    });
+
+    return Response.json({
+      prNumber: prNumber,
+      prUrl: prUrl,
+      state: prState,
+    });
+  }
+
+  /**
    * Generate a WebSocket authentication token for a participant.
    *
    * This endpoint:
    * 1. Creates or updates a participant record
    * 2. Generates a 256-bit random token
    * 3. Stores the SHA-256 hash in the participant record
-   * 4. Optionally stores encrypted GitHub token for PR creation
+   * 4. Optionally stores encrypted GitHub/Bitbucket token for PR creation
    * 5. Returns the plain token to the caller
    */
   private async handleGenerateWsToken(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       userId: string;
+      vcsProvider?: VCSProvider;
+      // GitHub fields
       githubUserId?: string;
       githubLogin?: string;
       githubName?: string;
       githubEmail?: string;
       githubTokenEncrypted?: string | null; // Encrypted GitHub OAuth token for PR creation
       githubTokenExpiresAt?: number | null; // Token expiry timestamp in milliseconds
+      // Bitbucket fields
+      bitbucketUuid?: string;
+      bitbucketLogin?: string;
+      bitbucketDisplayName?: string;
+      bitbucketEmail?: string;
+      bitbucketTokenEncrypted?: string | null;
+      bitbucketRefreshTokenEncrypted?: string | null;
+      bitbucketTokenExpiresAt?: number | null;
     };
 
     if (!body.userId) {
@@ -2166,6 +2294,7 @@ export class SessionDO extends DurableObject<Env> {
     }
 
     const now = Date.now();
+    const vcsProvider = body.vcsProvider || "github";
 
     // Check if participant exists
     let participant = this.getParticipantByUserId(body.userId);
@@ -2174,25 +2303,45 @@ export class SessionDO extends DurableObject<Env> {
       // Update existing participant with any new info
       // Use COALESCE for token fields to only update if new values provided
       this.repository.updateParticipantCoalesce(participant.id, {
+        vcsProvider: vcsProvider,
+        // GitHub fields
         githubUserId: body.githubUserId ?? null,
         githubLogin: body.githubLogin ?? null,
         githubName: body.githubName ?? null,
         githubEmail: body.githubEmail ?? null,
         githubAccessTokenEncrypted: body.githubTokenEncrypted ?? null,
         githubTokenExpiresAt: body.githubTokenExpiresAt ?? null,
+        // Bitbucket fields
+        bitbucketUuid: body.bitbucketUuid ?? null,
+        bitbucketLogin: body.bitbucketLogin ?? null,
+        bitbucketDisplayName: body.bitbucketDisplayName ?? null,
+        bitbucketEmail: body.bitbucketEmail ?? null,
+        bitbucketAccessTokenEncrypted: body.bitbucketTokenEncrypted ?? null,
+        bitbucketRefreshTokenEncrypted: body.bitbucketRefreshTokenEncrypted ?? null,
+        bitbucketTokenExpiresAt: body.bitbucketTokenExpiresAt ?? null,
       });
     } else {
-      // Create new participant with optional GitHub token
+      // Create new participant with optional GitHub/Bitbucket token
       const id = generateId();
       this.repository.createParticipant({
         id,
         userId: body.userId,
+        vcsProvider: vcsProvider,
+        // GitHub fields
         githubUserId: body.githubUserId ?? null,
         githubLogin: body.githubLogin ?? null,
         githubName: body.githubName ?? null,
         githubEmail: body.githubEmail ?? null,
         githubAccessTokenEncrypted: body.githubTokenEncrypted ?? null,
         githubTokenExpiresAt: body.githubTokenExpiresAt ?? null,
+        // Bitbucket fields
+        bitbucketUuid: body.bitbucketUuid ?? null,
+        bitbucketLogin: body.bitbucketLogin ?? null,
+        bitbucketDisplayName: body.bitbucketDisplayName ?? null,
+        bitbucketEmail: body.bitbucketEmail ?? null,
+        bitbucketAccessTokenEncrypted: body.bitbucketTokenEncrypted ?? null,
+        bitbucketRefreshTokenEncrypted: body.bitbucketRefreshTokenEncrypted ?? null,
+        bitbucketTokenExpiresAt: body.bitbucketTokenExpiresAt ?? null,
         role: "member",
         joinedAt: now,
       });
@@ -2206,7 +2355,7 @@ export class SessionDO extends DurableObject<Env> {
     // Store the hash (invalidates any previous token)
     this.repository.updateParticipantWsToken(participant.id, tokenHash, now);
 
-    this.log.info("Generated WS token", { participant_id: participant.id, user_id: body.userId });
+    this.log.info("Generated WS token", { participant_id: participant.id, user_id: body.userId, vcs_provider: vcsProvider });
 
     return Response.json({
       token: plainToken,

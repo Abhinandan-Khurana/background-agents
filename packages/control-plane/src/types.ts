@@ -28,6 +28,13 @@ export interface Env {
   GITHUB_APP_PRIVATE_KEY?: string;
   GITHUB_APP_INSTALLATION_ID?: string;
 
+  // Bitbucket OAuth configuration
+  BITBUCKET_CLIENT_ID?: string;
+  BITBUCKET_CLIENT_SECRET?: string;
+  // Bitbucket Forge (Bot Account) for Git operations
+  BITBUCKET_BOT_USERNAME?: string;
+  BITBUCKET_BOT_APP_PASSWORD?: string;
+
   // Variables
   DEPLOYMENT_NAME: string;
   WORKER_URL?: string; // Base URL for the worker (for callbacks)
@@ -237,6 +244,7 @@ export interface CreateSessionRequest {
   repoName: string;
   title?: string;
   model?: string; // LLM model to use (e.g., "claude-haiku-4-5", "claude-sonnet-4-5")
+  vcsProvider?: VCSProvider; // Defaults to 'github' if not specified
 }
 
 export interface CreateSessionResponse {
@@ -323,3 +331,46 @@ export interface GitHubTokenResponse {
   refresh_token?: string;
   expires_in?: number;
 }
+
+// Bitbucket OAuth types
+export interface BitbucketUser {
+  uuid: string;
+  username: string | null; // May be null for users who haven't set a username
+  display_name: string;
+  account_id: string;
+  email?: string | null; // Only available with email scope
+  links: {
+    avatar?: { href: string };
+  };
+}
+
+export interface BitbucketTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  expires_in: number; // Seconds until expiration (typically 3600 = 1 hour)
+  scopes: string;
+}
+
+// VCS Provider type
+export type VCSProvider = "github" | "bitbucket";
+
+// Bitbucket OAuth types
+export interface BitbucketUser {
+  uuid: string;
+  username: string | null;
+  display_name: string;
+  email: string | null;
+  avatar_url: string | null;
+}
+
+export interface BitbucketTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  expires_in: number; // seconds
+  scopes: string;
+}
+
+// VCS Provider type
+export type VCSProvider = "github" | "bitbucket";

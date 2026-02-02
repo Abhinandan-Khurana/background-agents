@@ -58,6 +58,13 @@ class SandboxSupervisor:
         self.repo_name = os.environ.get("REPO_NAME", "")
         self.github_app_token = os.environ.get("GITHUB_APP_TOKEN", "")
 
+        # VCS provider (github or bitbucket)
+        self.vcs_provider = os.environ.get("VCS_PROVIDER", "github")
+
+        # Bitbucket bot credentials
+        self.bitbucket_bot_username = os.environ.get("BITBUCKET_BOT_USERNAME", "")
+        self.bitbucket_bot_app_password = os.environ.get("BITBUCKET_BOT_APP_PASSWORD", "")
+
         # Parse session config if provided
         session_config_json = os.environ.get("SESSION_CONFIG", "{}")
         self.session_config = json.loads(session_config_json)
@@ -76,6 +83,24 @@ class SandboxSupervisor:
             session_id=session_id,
         )
 
+    def _get_clone_url(self) -> str:
+        """Get authenticated clone URL based on VCS provider."""
+        if self.vcs_provider == "bitbucket":
+            if self.bitbucket_bot_username and self.bitbucket_bot_app_password:
+                return f"https://{self.bitbucket_bot_username}:{self.bitbucket_bot_app_password}@bitbucket.org/{self.repo_owner}/{self.repo_name}.git"
+            return f"https://bitbucket.org/{self.repo_owner}/{self.repo_name}.git"
+        else:  # github
+            if self.github_app_token:
+                return f"https://x-access-token:{self.github_app_token}@github.com/{self.repo_owner}/{self.repo_name}.git"
+            return f"https://github.com/{self.repo_owner}/{self.repo_name}.git"
+
+    def _get_public_clone_url(self) -> str:
+        """Get public (unauthenticated) clone URL based on VCS provider."""
+        if self.vcs_provider == "bitbucket":
+            return f"https://bitbucket.org/{self.repo_owner}/{self.repo_name}.git"
+        else:  # github
+            return f"https://github.com/{self.repo_owner}/{self.repo_name}.git"
+
     async def perform_git_sync(self) -> bool:
         """
         Clone repository if needed, then synchronize with latest changes.
@@ -88,7 +113,9 @@ class SandboxSupervisor:
             repo_owner=self.repo_owner,
             repo_name=self.repo_name,
             repo_path=str(self.repo_path),
+            vcs_provider=self.vcs_provider,
             has_github_token=bool(self.github_app_token),
+            has_bitbucket_creds=bool(self.bitbucket_bot_username and self.bitbucket_bot_app_password),
         )
 
         # Clone the repository if it doesn't exist
@@ -102,14 +129,11 @@ class SandboxSupervisor:
                 "git.clone_start",
                 repo_owner=self.repo_owner,
                 repo_name=self.repo_name,
-                authenticated=bool(self.github_app_token),
+                vcs_provider=self.vcs_provider,
+                authenticated=bool(self._get_clone_url() != self._get_public_clone_url()),
             )
 
-            # Use authenticated URL if GitHub App token is available
-            if self.github_app_token:
-                clone_url = f"https://x-access-token:{self.github_app_token}@github.com/{self.repo_owner}/{self.repo_name}.git"
-            else:
-                clone_url = f"https://github.com/{self.repo_owner}/{self.repo_name}.git"
+            clone_url = self._get_clone_url()
 
             result = await asyncio.create_subprocess_exec(
                 "git",
@@ -136,18 +160,17 @@ class SandboxSupervisor:
 
         try:
             # Configure remote URL with auth token if available
-            if self.github_app_token:
-                auth_url = f"https://x-access-token:{self.github_app_token}@github.com/{self.repo_owner}/{self.repo_name}.git"
-                await asyncio.create_subprocess_exec(
-                    "git",
-                    "remote",
-                    "set-url",
-                    "origin",
-                    auth_url,
-                    cwd=self.repo_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+            auth_url = self._get_clone_url()
+            await asyncio.create_subprocess_exec(
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                auth_url,
+                cwd=self.repo_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
             # Fetch latest changes
             result = await asyncio.create_subprocess_exec(

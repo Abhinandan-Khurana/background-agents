@@ -28,15 +28,24 @@ CREATE TABLE IF NOT EXISTS session (
 CREATE TABLE IF NOT EXISTS participants (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
+  vcs_provider TEXT DEFAULT 'github',               -- 'github' | 'bitbucket'
   github_user_id TEXT,                              -- GitHub numeric ID
   github_login TEXT,                                -- GitHub username
   github_email TEXT,                                -- For git commit attribution
   github_name TEXT,                                 -- Display name for git commits
-  role TEXT NOT NULL DEFAULT 'member',              -- 'owner', 'member'
+  -- Bitbucket-specific fields
+  bitbucket_uuid TEXT,                              -- Bitbucket user UUID
+  bitbucket_login TEXT,                             -- Bitbucket username
+  bitbucket_email TEXT,                             -- For git commit attribution
+  bitbucket_display_name TEXT,                      -- Display name for git commits
   -- Token storage (AES-GCM encrypted)
   github_access_token_encrypted TEXT,
   github_refresh_token_encrypted TEXT,
   github_token_expires_at INTEGER,                  -- Unix timestamp
+  -- Bitbucket token storage
+  bitbucket_access_token_encrypted TEXT,
+  bitbucket_refresh_token_encrypted TEXT,
+  bitbucket_token_expires_at INTEGER,               -- Unix timestamp
   -- WebSocket authentication
   ws_auth_token TEXT,                               -- SHA-256 hash of WebSocket auth token
   ws_token_created_at INTEGER,                      -- When the token was generated
@@ -168,4 +177,17 @@ export function initSchema(sql: SqlStorage): void {
 
   // Migration: Add callback_context column to messages table for Slack follow-up notifications
   runMigration(sql, `ALTER TABLE messages ADD COLUMN callback_context TEXT`);
+
+  // Migration: Add VCS provider discriminator for Bitbucket support
+  runMigration(sql, `ALTER TABLE session ADD COLUMN vcs_provider TEXT DEFAULT 'github'`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN vcs_provider TEXT DEFAULT 'github'`);
+
+  // Migration: Add Bitbucket-specific columns to participants table
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_access_token_encrypted TEXT`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_refresh_token_encrypted TEXT`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_token_expires_at INTEGER`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_uuid TEXT`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_login TEXT`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_email TEXT`);
+  runMigration(sql, `ALTER TABLE participants ADD COLUMN bitbucket_display_name TEXT`);
 }

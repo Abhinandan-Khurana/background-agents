@@ -180,6 +180,33 @@ You should now have:
 
 ---
 
+## Step 3b: Configure Bitbucket Integration (Optional)
+
+If you want to support Bitbucket repositories, you'll need to set up an OAuth Consumer and a System Bot account.
+
+### 1. Create OAuth Consumer
+1. Go to your [Bitbucket Workspace Settings](https://bitbucket.org/account/workspaces/)
+2. Select your workspace -> **OAuth consumers** -> **Add consumer**
+3. Fill in the details:
+   - **Name**: `Open-Inspect`
+   - **Callback URL**: `https://open-inspect-{your-deployment-name}.vercel.app/api/auth/callback/bitbucket`
+4. Set **Permissions**:
+   - Account: **Read**
+   - Repositories: **Write** (required for creating PRs)
+   - Pull requests: **Read**
+5. Click **Save** and note the **Key** (Client ID) and **Secret** (Client Secret)
+
+### 2. Create System Bot Account
+Since Bitbucket OAuth tokens expire quickly (1 hour), Open-Inspect uses a dedicated "System Bot" account for stable git operations (cloning/pushing) in background agents.
+
+1. Create a new Bitbucket account for your bot (e.g., `your-org-bot`)
+2. Grant this user **Write** access to the repositories you want to use
+3. Log in as the bot user and go to **Personal settings** -> **App passwords**
+4. Create an App Password with **Repositories: Write** permission
+5. Note the **Username** and **App Password**
+
+---
+
 ## Step 4: Create Slack App (Optional)
 
 Skip this step if you don't need Slack integration.
@@ -285,6 +312,12 @@ github_app_private_key     = <<-EOF
 ... paste your PKCS#8 key here ...
 -----END PRIVATE KEY-----
 EOF
+
+# Bitbucket (Optional)
+bitbucket_client_id        = "your-consumer-key"
+bitbucket_client_secret    = "your-consumer-secret"
+bitbucket_bot_username     = "your-bot-username"
+bitbucket_bot_app_password = "your-bot-app-password"
 
 # Slack (leave as empty strings to disable Slack integration)
 slack_bot_token      = ""

@@ -37,6 +37,11 @@ class SandboxConfig:
     sandbox_auth_token: str = ""
     timeout_hours: float = 2.0
     github_app_token: str | None = None  # GitHub App token for git operations
+    # VCS provider
+    vcs_provider: str = "github"  # 'github' or 'bitbucket'
+    # Bitbucket credentials (for git operations when using Bitbucket)
+    bitbucket_bot_username: str | None = None
+    bitbucket_bot_app_password: str | None = None
 
 
 @dataclass
@@ -109,11 +114,18 @@ class SandboxManager:
             "SANDBOX_AUTH_TOKEN": config.sandbox_auth_token,
             "REPO_OWNER": config.repo_owner,
             "REPO_NAME": config.repo_name,
+            "VCS_PROVIDER": config.vcs_provider,
         }
 
         # Add GitHub App token if available (for git sync operations)
         if config.github_app_token:
             env_vars["GITHUB_APP_TOKEN"] = config.github_app_token
+
+        # Add Bitbucket bot credentials if available (for Bitbucket git operations)
+        if config.bitbucket_bot_username:
+            env_vars["BITBUCKET_BOT_USERNAME"] = config.bitbucket_bot_username
+        if config.bitbucket_bot_app_password:
+            env_vars["BITBUCKET_BOT_APP_PASSWORD"] = config.bitbucket_bot_app_password
 
         if config.session_config:
             env_vars["SESSION_CONFIG"] = config.session_config.model_dump_json()
