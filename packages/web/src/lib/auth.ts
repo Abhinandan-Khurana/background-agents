@@ -33,7 +33,15 @@ function BitbucketProvider(options: {
         ...options.authorization?.params,
       },
     },
-    token: "https://bitbucket.org/site/oauth2/access_token",
+    token: {
+      url: "https://bitbucket.org/site/oauth2/access_token",
+      // Bitbucket requires Content-Type: application/x-www-form-urlencoded
+      // This is handled by NextAuth, but we need to ensure proper grant_type
+    },
+    // Bitbucket requires HTTP Basic auth for token endpoint (client_secret_basic)
+    client: {
+      token_endpoint_auth_method: "client_secret_basic",
+    },
     userinfo: {
       url: "https://api.bitbucket.org/2.0/user",
       async request({ tokens, provider }) {
@@ -131,7 +139,8 @@ export const authOptions: NextAuthOptions = {
         params: {
           // repository:write - needed to create PRs
           // account - needed for user profile
-          scope: "repository:write account",
+          // email - needed to fetch user email from /2.0/user/emails
+          scope: "repository:write account email",
         },
       },
     }),
