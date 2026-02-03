@@ -44,8 +44,8 @@ function BitbucketProvider(options: {
     },
     userinfo: {
       url: "https://api.bitbucket.org/2.0/user",
-      async request({ tokens, provider }) {
-        const profile = await fetch(provider.userinfo?.url as string, {
+      async request({ tokens }) {
+        const profile = await fetch("https://api.bitbucket.org/2.0/user", {
           headers: {
             Authorization: `Bearer ${tokens.access_token}`,
           },

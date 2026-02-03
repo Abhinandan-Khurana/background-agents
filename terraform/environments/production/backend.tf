@@ -11,9 +11,11 @@
 #      -backend-config="endpoints={s3=\"https://<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com\"}"
 #
 # Or create a backend.tfvars file (gitignored) with:
-#   access_key = "your-r2-access-key-id"
-#   secret_key = "your-r2-secret-access-key"
-#   endpoints  = { s3 = "https://<account-id>.r2.cloudflarestorage.com" }
+#access_key = ""
+#secret_key = ""
+#endpoints  = {
+#  s3 = ""
+#}
 #
 # Then run: terraform init -backend-config=backend.tfvars
 
