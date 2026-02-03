@@ -5,7 +5,15 @@
 import type { Env, CreateSessionRequest, CreateSessionResponse } from "./types";
 import { generateId, encryptToken } from "./auth/crypto";
 import { verifyInternalToken } from "./auth/internal";
-import { getGitHubAppConfig, listInstallationRepositories } from "./auth/github-app";
+import {
+  getGitHubAppConfig,
+  getInstallationRepository,
+  listInstallationRepositories,
+} from "./auth/github-app";
+import { RepoSecretsStore, RepoSecretsValidationError } from "./db/repo-secrets";
+import { SessionIndexStore } from "./db/session-index";
+
+import { RepoMetadataStore } from "./db/repo-metadata";
 import { listBitbucketRepos, getValidAccessToken as getValidBitbucketToken } from "./auth/bitbucket";
 import type { VCSProvider } from "./types";
 import type {
@@ -13,11 +21,13 @@ import type {
   InstallationRepository,
   RepoMetadata,
 } from "@open-inspect/shared";
-import { getRepoMetadataKey } from "./utils/repo";
 import { createLogger } from "./logger";
 import type { CorrelationContext } from "./logger";
 
 const logger = createLogger("router");
+
+const REPOS_CACHE_KEY = "repos:list";
+const REPOS_CACHE_TTL_SECONDS = 300; // 5 minutes
 
 /**
  * Request context with correlation IDs propagated to downstream services.
@@ -318,6 +328,21 @@ const routes: Route[] = [
     pattern: parsePattern("/repos/:owner/:name/metadata"),
     handler: handleGetRepoMetadata,
   },
+  {
+    method: "PUT",
+    pattern: parsePattern("/repos/:owner/:name/secrets"),
+    handler: handleSetRepoSecrets,
+  },
+  {
+    method: "GET",
+    pattern: parsePattern("/repos/:owner/:name/secrets"),
+    handler: handleListRepoSecrets,
+  },
+  {
+    method: "DELETE",
+    pattern: parsePattern("/repos/:owner/:name/secrets/:key"),
+    handler: handleDeleteRepoSecret,
+  },
 ];
 
 /**
@@ -458,27 +483,17 @@ async function handleListSessions(
 ): Promise<Response> {
   const url = new URL(request.url);
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 100);
-  const cursor = url.searchParams.get("cursor") || undefined;
+  const offset = parseInt(url.searchParams.get("offset") || "0");
+  const status = url.searchParams.get("status") || undefined;
+  const excludeStatus = url.searchParams.get("excludeStatus") || undefined;
 
-  // List sessions from KV index
-  const listResult = await env.SESSION_INDEX.list({
-    prefix: "session:",
-    limit,
-    cursor,
-  });
-
-  // Fetch session data for each key
-  const sessions = await Promise.all(
-    listResult.keys.map(async (key) => {
-      const data = await env.SESSION_INDEX.get(key.name, "json");
-      return data;
-    })
-  );
+  const store = new SessionIndexStore(env.DB);
+  const result = await store.list({ status, excludeStatus, limit, offset });
 
   return json({
-    sessions: sessions.filter(Boolean),
-    cursor: listResult.list_complete ? undefined : listResult.cursor,
-    hasMore: !listResult.list_complete,
+    sessions: result.sessions,
+    total: result.total,
+    hasMore: result.hasMore,
   });
 }
 
@@ -516,6 +531,26 @@ async function handleCreateSession(
   // Normalize repo identifiers to lowercase for consistent storage
   const repoOwner = body.repoOwner.toLowerCase();
   const repoName = body.repoName.toLowerCase();
+
+  let repoId: number;
+  try {
+    const resolved = await resolveInstalledRepo(env, repoOwner, repoName);
+    if (!resolved) {
+      return error("Repository is not installed for the GitHub App", 404);
+    }
+    repoId = resolved.repoId;
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    logger.error("Failed to resolve repository", {
+      error: message,
+      repo_owner: repoOwner,
+      repo_name: repoName,
+    });
+    return error(
+      message === "GitHub App not configured" ? message : "Failed to resolve repository",
+      500
+    );
+  }
 
   // VCS provider (default to github for backwards compatibility)
   const vcsProvider: VCSProvider = body.vcsProvider || "github";
@@ -584,6 +619,7 @@ async function handleCreateSession(
           sessionName: sessionId, // Pass the session name for WebSocket routing
           repoOwner,
           repoName,
+          repoId,
           title: body.title,
           model: body.model || "claude-haiku-4-5", // Default to haiku for cost efficiency
           vcsProvider,
@@ -611,22 +647,20 @@ async function handleCreateSession(
     return error("Failed to create session", 500);
   }
 
-  // Store session in KV index for listing
+  // Store session in D1 index for listing
   const now = Date.now();
-  await env.SESSION_INDEX.put(
-    `session:${sessionId}`,
-    JSON.stringify({
-      id: sessionId,
-      title: body.title || null,
-      repoOwner,
-      repoName,
-      model: body.model || "claude-haiku-4-5",
+  const sessionStore = new SessionIndexStore(env.DB);
+  await sessionStore.create({
+    id: sessionId,
+    title: body.title || null,
+    repoOwner,
+    repoName,
+    model: body.model || "claude-haiku-4-5",
       vcsProvider,
-      status: "created",
-      createdAt: now,
-      updatedAt: now,
-    })
-  );
+    status: "created",
+    createdAt: now,
+    updatedAt: now,
+  });
 
   const result: CreateSessionResponse = {
     sessionId,
@@ -668,8 +702,9 @@ async function handleDeleteSession(
   const sessionId = match.groups?.id;
   if (!sessionId) return error("Session ID required");
 
-  // Delete from KV index
-  await env.SESSION_INDEX.delete(`session:${sessionId}`);
+  // Delete from D1 index
+  const sessionStore = new SessionIndexStore(env.DB);
+  await sessionStore.delete(sessionId);
 
   // Note: Durable Object data will be garbage collected by Cloudflare
   // when no longer referenced. We could also call a cleanup method on the DO.
@@ -880,6 +915,7 @@ async function handleSessionWsToken(
     githubEmail?: string;
     githubToken?: string; // User's GitHub OAuth token for PR creation
     githubTokenExpiresAt?: number; // Token expiry timestamp in milliseconds
+    githubRefreshToken?: string; // GitHub OAuth refresh token for server-side renewal
     // Bitbucket fields
     bitbucketUuid?: string;
     bitbucketLogin?: string;
@@ -904,6 +940,21 @@ async function handleSessionWsToken(
         error: e instanceof Error ? e : String(e),
       });
       // Continue without token - PR creation will fail if this user triggers it
+    }
+  }
+
+  // Encrypt the GitHub refresh token if provided
+  let githubRefreshTokenEncrypted: string | null = null;
+  if (body.githubRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
+    try {
+      githubRefreshTokenEncrypted = await encryptToken(
+        body.githubRefreshToken,
+        env.TOKEN_ENCRYPTION_KEY
+      );
+    } catch (e) {
+      logger.error("Failed to encrypt GitHub refresh token", {
+        error: e instanceof Error ? e : String(e),
+      });
     }
   }
 
@@ -942,6 +993,7 @@ async function handleSessionWsToken(
           githubName: body.githubName,
           githubEmail: body.githubEmail,
           githubTokenEncrypted,
+          githubRefreshTokenEncrypted,
           githubTokenExpiresAt: body.githubTokenExpiresAt,
           bitbucketUuid: body.bitbucketUuid,
           bitbucketLogin: body.bitbucketLogin,
@@ -993,22 +1045,11 @@ async function handleArchiveSession(
   );
 
   if (response.ok) {
-    // Update KV index
-    const sessionData = (await env.SESSION_INDEX.get(`session:${sessionId}`, "json")) as Record<
-      string,
-      unknown
-    > | null;
-    if (sessionData) {
-      await env.SESSION_INDEX.put(
-        `session:${sessionId}`,
-        JSON.stringify({
-          ...sessionData,
-          status: "archived",
-          updatedAt: Date.now(),
-        })
-      );
-    } else {
-      logger.warn("Session not found in KV index during archive", { session_id: sessionId });
+    // Update D1 index
+    const sessionStore = new SessionIndexStore(env.DB);
+    const updated = await sessionStore.updateStatus(sessionId, "archived");
+    if (!updated) {
+      logger.warn("Session not found in D1 index during archive", { session_id: sessionId });
     }
   }
 
@@ -1049,22 +1090,11 @@ async function handleUnarchiveSession(
   );
 
   if (response.ok) {
-    // Update KV index
-    const sessionData = (await env.SESSION_INDEX.get(`session:${sessionId}`, "json")) as Record<
-      string,
-      unknown
-    > | null;
-    if (sessionData) {
-      await env.SESSION_INDEX.put(
-        `session:${sessionId}`,
-        JSON.stringify({
-          ...sessionData,
-          status: "active",
-          updatedAt: Date.now(),
-        })
-      );
-    } else {
-      logger.warn("Session not found in KV index during unarchive", { session_id: sessionId });
+    // Update D1 index
+    const sessionStore = new SessionIndexStore(env.DB);
+    const updated = await sessionStore.updateStatus(sessionId, "active");
+    if (!updated) {
+      logger.warn("Session not found in D1 index during unarchive", { session_id: sessionId });
     }
   }
 
@@ -1073,8 +1103,30 @@ async function handleUnarchiveSession(
 
 // Repository handlers
 
+async function resolveInstalledRepo(
+  env: Env,
+  repoOwner: string,
+  repoName: string
+): Promise<{ repoId: number; repoOwner: string; repoName: string } | null> {
+  const appConfig = getGitHubAppConfig(env);
+  if (!appConfig) {
+    throw new Error("GitHub App not configured");
+  }
+
+  const repo = await getInstallationRepository(appConfig, repoOwner, repoName);
+  if (!repo) {
+    return null;
+  }
+
+  return {
+    repoId: repo.id,
+    repoOwner: repoOwner.toLowerCase(),
+    repoName: repoName.toLowerCase(),
+  };
+}
+
 /**
- * Cached repos list structure.
+ * Cached repos list structure stored in KV.
  */
 interface CachedReposList {
   repos: EnrichedRepository[];
@@ -1084,6 +1136,7 @@ interface CachedReposList {
 /**
  * List all repositories accessible via the GitHub App installation or Bitbucket user token.
  * Results are cached in KV for 5 minutes to avoid rate limits.
+ * KV is shared across isolates, so cache invalidation is consistent.
  *
  * For GitHub: Uses GitHub App installation token
  * For Bitbucket: Uses user's OAuth token from X-User-Token header
@@ -1104,7 +1157,7 @@ async function handleListRepos(
 
   // Check KV cache first
   try {
-    const cached = (await env.SESSION_INDEX.get(CACHE_KEY, "json")) as CachedReposList | null;
+    const cached = await env.REPOS_CACHE.get<CachedReposList>(REPOS_CACHE_KEY, "json");
     if (cached) {
       return json({
         repos: cached.repos,
@@ -1178,43 +1231,32 @@ async function handleListRepos(
     return error("Failed to fetch repositories from GitHub", 500);
   }
 
-  // Enrich repos with stored metadata
-  const enrichedRepos: EnrichedRepository[] = await Promise.all(
-    repos.map(async (repo) => {
-      const newKey = getRepoMetadataKey(repo.owner, repo.name);
-      const oldKey = `repo:metadata:${repo.fullName}`; // Original casing for migration
-
-      try {
-        let metadata = (await env.SESSION_INDEX.get(newKey, "json")) as RepoMetadata | null;
-
-        // Migration: check old key pattern if metadata not found at new key
-        if (!metadata && repo.fullName.toLowerCase() !== newKey.replace("repo:metadata:", "")) {
-          metadata = (await env.SESSION_INDEX.get(oldKey, "json")) as RepoMetadata | null;
-          if (metadata) {
-            // Migrate to new key
-            await env.SESSION_INDEX.put(newKey, JSON.stringify(metadata));
-            await env.SESSION_INDEX.delete(oldKey);
-            logger.info("Migrated repo metadata key", { old_key: oldKey, new_key: newKey });
-          }
-        }
-
-        return metadata ? { ...repo, metadata } : repo;
-      } catch {
-        return repo;
-      }
-    })
-  );
-
-  // Cache the results
-  const cachedAt = new Date().toISOString();
-  const cacheData: CachedReposList = {
-    repos: enrichedRepos,
-    cachedAt,
-  };
-
+  // Batch-fetch metadata from D1
+  const metadataStore = new RepoMetadataStore(env.DB);
+  let metadataMap: Map<string, RepoMetadata>;
   try {
-    await env.SESSION_INDEX.put(CACHE_KEY, JSON.stringify(cacheData), {
-      expirationTtl: CACHE_TTL,
+    metadataMap = await metadataStore.getBatch(
+      repos.map((r) => ({ owner: r.owner, name: r.name }))
+    );
+  } catch (e) {
+    logger.warn("Failed to fetch repo metadata batch", {
+      error: e instanceof Error ? e : String(e),
+    });
+    metadataMap = new Map();
+  }
+
+  // Enrich repos with stored metadata
+  const enrichedRepos: EnrichedRepository[] = repos.map((repo) => {
+    const key = `${repo.owner.toLowerCase()}/${repo.name.toLowerCase()}`;
+    const metadata = metadataMap.get(key);
+    return metadata ? { ...repo, metadata } : repo;
+  });
+
+  // Cache the results in KV with TTL
+  const cachedAt = new Date().toISOString();
+  try {
+    await env.REPOS_CACHE.put(REPOS_CACHE_KEY, JSON.stringify({ repos: enrichedRepos, cachedAt }), {
+      expirationTtl: REPOS_CACHE_TTL_SECONDS,
     });
   } catch (e) {
     logger.warn("Failed to cache repos list", { error: e instanceof Error ? e : String(e) });
@@ -1258,13 +1300,13 @@ async function handleUpdateRepoMetadata(
     }).filter(([, v]) => v !== undefined)
   ) as RepoMetadata;
 
-  const metadataKey = getRepoMetadataKey(owner, name);
+  const metadataStore = new RepoMetadataStore(env.DB);
 
   try {
-    await env.SESSION_INDEX.put(metadataKey, JSON.stringify(metadata));
+    await metadataStore.upsert(owner, name, metadata);
 
-    // Invalidate the repos cache so next fetch includes updated metadata
-    await env.SESSION_INDEX.delete("repos:list");
+    // Invalidate the KV repos cache so next fetch includes updated metadata
+    await env.REPOS_CACHE.delete(REPOS_CACHE_KEY);
 
     // Return normalized repo identifier
     const normalizedRepo = `${owner.toLowerCase()}/${name.toLowerCase()}`;
@@ -1297,25 +1339,276 @@ async function handleGetRepoMetadata(
     return error("Owner and name are required");
   }
 
-  const metadataKey = getRepoMetadataKey(owner, name);
   const normalizedRepo = `${owner.toLowerCase()}/${name.toLowerCase()}`;
+  const metadataStore = new RepoMetadataStore(env.DB);
 
   try {
-    const metadata = (await env.SESSION_INDEX.get(metadataKey, "json")) as RepoMetadata | null;
-
-    if (!metadata) {
-      return json({
-        repo: normalizedRepo,
-        metadata: null,
-      });
-    }
+    const metadata = await metadataStore.get(owner, name);
 
     return json({
       repo: normalizedRepo,
-      metadata,
+      metadata: metadata ?? null,
     });
   } catch (e) {
     logger.error("Failed to get repo metadata", { error: e instanceof Error ? e : String(e) });
     return error("Failed to get metadata", 500);
+  }
+}
+
+/**
+ * Upsert secrets for a repository.
+ */
+async function handleSetRepoSecrets(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray,
+  ctx: RequestContext
+): Promise<Response> {
+  if (!env.DB) {
+    return error("Secrets storage is not configured", 503);
+  }
+  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
+    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
+  }
+
+  const owner = match.groups?.owner;
+  const name = match.groups?.name;
+  if (!owner || !name) {
+    return error("Owner and name are required");
+  }
+
+  let resolved;
+  try {
+    resolved = await resolveInstalledRepo(env, owner, name);
+    if (!resolved) {
+      return error("Repository is not installed for the GitHub App", 404);
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    logger.error("Failed to resolve repository for secrets", {
+      error: message,
+      repo_owner: owner,
+      repo_name: name,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error(
+      message === "GitHub App not configured" ? message : "Failed to resolve repository",
+      500
+    );
+  }
+
+  let body: { secrets?: Record<string, string> };
+  try {
+    body = (await request.json()) as { secrets?: Record<string, string> };
+  } catch {
+    return error("Invalid JSON body", 400);
+  }
+
+  if (!body?.secrets || typeof body.secrets !== "object") {
+    return error("Request body must include secrets object", 400);
+  }
+
+  const store = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
+
+  try {
+    const result = await store.setSecrets(
+      resolved.repoId,
+      resolved.repoOwner,
+      resolved.repoName,
+      body.secrets
+    );
+
+    logger.info("repo.secrets_updated", {
+      event: "repo.secrets_updated",
+      repo_id: resolved.repoId,
+      repo_owner: resolved.repoOwner,
+      repo_name: resolved.repoName,
+      keys_count: result.keys.length,
+      created: result.created,
+      updated: result.updated,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+
+    return json({
+      status: "updated",
+      repo: `${resolved.repoOwner}/${resolved.repoName}`,
+      keys: result.keys,
+      created: result.created,
+      updated: result.updated,
+    });
+  } catch (e) {
+    if (e instanceof RepoSecretsValidationError) {
+      return error(e.message, 400);
+    }
+    logger.error("Failed to update repo secrets", {
+      error: e instanceof Error ? e.message : String(e),
+      repo_id: resolved.repoId,
+      repo_owner: resolved.repoOwner,
+      repo_name: resolved.repoName,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error("Secrets storage unavailable", 503);
+  }
+}
+
+/**
+ * List secret keys for a repository.
+ */
+async function handleListRepoSecrets(
+  _request: Request,
+  env: Env,
+  match: RegExpMatchArray,
+  ctx: RequestContext
+): Promise<Response> {
+  if (!env.DB) {
+    return error("Secrets storage is not configured", 503);
+  }
+  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
+    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
+  }
+
+  const owner = match.groups?.owner;
+  const name = match.groups?.name;
+  if (!owner || !name) {
+    return error("Owner and name are required");
+  }
+
+  let resolved;
+  try {
+    resolved = await resolveInstalledRepo(env, owner, name);
+    if (!resolved) {
+      return error("Repository is not installed for the GitHub App", 404);
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    logger.error("Failed to resolve repository for secrets list", {
+      error: message,
+      repo_owner: owner,
+      repo_name: name,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error(
+      message === "GitHub App not configured" ? message : "Failed to resolve repository",
+      500
+    );
+  }
+
+  const store = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
+
+  try {
+    const secrets = await store.listSecretKeys(resolved.repoId);
+
+    logger.info("repo.secrets_listed", {
+      event: "repo.secrets_listed",
+      repo_id: resolved.repoId,
+      repo_owner: resolved.repoOwner,
+      repo_name: resolved.repoName,
+      keys_count: secrets.length,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+
+    return json({
+      repo: `${resolved.repoOwner}/${resolved.repoName}`,
+      secrets,
+    });
+  } catch (e) {
+    logger.error("Failed to list repo secrets", {
+      error: e instanceof Error ? e.message : String(e),
+      repo_id: resolved.repoId,
+      repo_owner: resolved.repoOwner,
+      repo_name: resolved.repoName,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error("Secrets storage unavailable", 503);
+  }
+}
+
+/**
+ * Delete a secret for a repository.
+ */
+async function handleDeleteRepoSecret(
+  _request: Request,
+  env: Env,
+  match: RegExpMatchArray,
+  ctx: RequestContext
+): Promise<Response> {
+  if (!env.DB) {
+    return error("Secrets storage is not configured", 503);
+  }
+  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
+    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
+  }
+
+  const owner = match.groups?.owner;
+  const name = match.groups?.name;
+  const key = match.groups?.key;
+  if (!owner || !name || !key) {
+    return error("Owner, name, and key are required");
+  }
+
+  let resolved;
+  try {
+    resolved = await resolveInstalledRepo(env, owner, name);
+    if (!resolved) {
+      return error("Repository is not installed for the GitHub App", 404);
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    logger.error("Failed to resolve repository for secrets delete", {
+      error: message,
+      repo_owner: owner,
+      repo_name: name,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error(
+      message === "GitHub App not configured" ? message : "Failed to resolve repository",
+      500
+    );
+  }
+
+  const store = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
+
+  try {
+    store.validateKey(store.normalizeKey(key));
+
+    const deleted = await store.deleteSecret(resolved.repoId, key);
+    if (!deleted) {
+      return error("Secret not found", 404);
+    }
+
+    logger.info("repo.secret_deleted", {
+      event: "repo.secret_deleted",
+      repo_id: resolved.repoId,
+      repo_owner: resolved.repoOwner,
+      repo_name: resolved.repoName,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+
+    return json({
+      status: "deleted",
+      repo: `${resolved.repoOwner}/${resolved.repoName}`,
+      key: store.normalizeKey(key),
+    });
+  } catch (e) {
+    if (e instanceof RepoSecretsValidationError) {
+      return error(e.message, 400);
+    }
+    logger.error("Failed to delete repo secret", {
+      error: e instanceof Error ? e.message : String(e),
+      repo_id: resolved.repoId,
+      repo_owner: resolved.repoOwner,
+      repo_name: resolved.repoName,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error("Secrets storage unavailable", 503);
   }
 }

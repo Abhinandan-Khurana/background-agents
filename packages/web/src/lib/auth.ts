@@ -176,7 +176,7 @@ export const authOptions: NextAuthOptions = {
     async jwt({ token, account, profile }) {
       if (account) {
         token.accessToken = account.access_token;
-        token.refreshToken = account.refresh_token;
+        token.refreshToken = account.refresh_token as string | undefined;
 
         if (account.provider === "github") {
           token.provider = "github";
@@ -185,8 +185,7 @@ export const authOptions: NextAuthOptions = {
           if (account.expires_at) {
             token.accessTokenExpiresAt = account.expires_at * 1000;
           } else {
-            // Default to 8 hours from now if not provided
-            token.accessTokenExpiresAt = Date.now() + 8 * 60 * 60 * 1000;
+            token.accessTokenExpiresAt = undefined;
           }
         } else if (account.provider === "bitbucket") {
           token.provider = "bitbucket";
