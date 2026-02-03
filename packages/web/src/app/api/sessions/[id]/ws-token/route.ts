@@ -26,18 +26,35 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const user = session.user;
     const userId = user.id || user.email || "anonymous";
 
+    const accessToken = (session as { accessToken?: string }).accessToken;
+    const provider = (session as { provider?: string }).provider;
+
+    // Prepare token request body
+    const tokenBody: Record<string, any> = {
+      userId,
+      vcsProvider: provider,
+    };
+
+    if (provider === "bitbucket") {
+      tokenBody.bitbucketUuid = user.id;
+      tokenBody.bitbucketLogin = user.login;
+      tokenBody.bitbucketDisplayName = user.name;
+      tokenBody.bitbucketEmail = user.email;
+      tokenBody.bitbucketToken = accessToken;
+      tokenBody.bitbucketTokenExpiresAt = (session as { accessTokenExpiresAt?: number }).accessTokenExpiresAt;
+    } else {
+      // Default to GitHub
+      tokenBody.githubUserId = user.id;
+      tokenBody.githubLogin = user.login;
+      tokenBody.githubName = user.name;
+      tokenBody.githubEmail = user.email;
+      tokenBody.githubToken = accessToken;
+      tokenBody.githubTokenExpiresAt = (session as { accessTokenExpiresAt?: number }).accessTokenExpiresAt;
+    }
+
     const response = await controlPlaneFetch(`/sessions/${sessionId}/ws-token`, {
       method: "POST",
-      body: JSON.stringify({
-        userId,
-        githubUserId: user.id,
-        githubLogin: user.login,
-        githubName: user.name,
-        githubEmail: user.email,
-        // Pass user's GitHub token for PR creation (will be encrypted by control plane)
-        githubToken: (session as { accessToken?: string }).accessToken,
-        githubTokenExpiresAt: (session as { accessTokenExpiresAt?: number }).accessTokenExpiresAt,
-      }),
+      body: JSON.stringify(tokenBody),
     });
 
     if (!response.ok) {

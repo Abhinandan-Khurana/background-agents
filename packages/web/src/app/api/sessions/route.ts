@@ -33,15 +33,28 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
 
-    // Get GitHub access token from session (added by next-auth callback)
-    const githubToken = (session as { accessToken?: string }).accessToken;
+    const accessToken = (session as { accessToken?: string }).accessToken;
+    const provider = (session as { provider?: string }).provider;
 
-    // Add the token to the session creation request
-    // The control plane will encrypt it before storing
-    const sessionBody = {
+    // Prepare session body with provider-specific token
+    const sessionBody: Record<string, any> = {
       ...body,
-      githubToken, // Plain token - control plane encrypts it
+      vcsProvider: provider,
     };
+
+    if (provider === "bitbucket") {
+      sessionBody.bitbucketToken = accessToken;
+      sessionBody.bitbucketUuid = session.user.id;
+      sessionBody.bitbucketLogin = session.user.login;
+      sessionBody.bitbucketDisplayName = session.user.name;
+      sessionBody.bitbucketEmail = session.user.email;
+    } else {
+      // Default to GitHub
+      sessionBody.githubToken = accessToken;
+      sessionBody.githubLogin = session.user.login;
+      sessionBody.githubName = session.user.name;
+      sessionBody.githubEmail = session.user.email;
+    }
 
     const response = await controlPlaneFetch("/sessions", {
       method: "POST",

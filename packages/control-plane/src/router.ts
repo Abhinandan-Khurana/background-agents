@@ -880,6 +880,14 @@ async function handleSessionWsToken(
     githubEmail?: string;
     githubToken?: string; // User's GitHub OAuth token for PR creation
     githubTokenExpiresAt?: number; // Token expiry timestamp in milliseconds
+    // Bitbucket fields
+    bitbucketUuid?: string;
+    bitbucketLogin?: string;
+    bitbucketDisplayName?: string;
+    bitbucketEmail?: string;
+    bitbucketToken?: string;
+    bitbucketRefreshToken?: string;
+    bitbucketTokenExpiresAt?: number;
   };
 
   if (!body.userId) {
@@ -896,6 +904,25 @@ async function handleSessionWsToken(
         error: e instanceof Error ? e : String(e),
       });
       // Continue without token - PR creation will fail if this user triggers it
+    }
+  }
+
+  // Encrypt the Bitbucket token if provided
+  let bitbucketTokenEncrypted: string | null = null;
+  let bitbucketRefreshTokenEncrypted: string | null = null;
+  if (body.bitbucketToken && env.TOKEN_ENCRYPTION_KEY) {
+    try {
+      bitbucketTokenEncrypted = await encryptToken(body.bitbucketToken, env.TOKEN_ENCRYPTION_KEY);
+      if (body.bitbucketRefreshToken) {
+        bitbucketRefreshTokenEncrypted = await encryptToken(
+          body.bitbucketRefreshToken,
+          env.TOKEN_ENCRYPTION_KEY
+        );
+      }
+    } catch (e) {
+      logger.error("Failed to encrypt Bitbucket token", {
+        error: e instanceof Error ? e : String(e),
+      });
     }
   }
 
@@ -916,6 +943,13 @@ async function handleSessionWsToken(
           githubEmail: body.githubEmail,
           githubTokenEncrypted,
           githubTokenExpiresAt: body.githubTokenExpiresAt,
+          bitbucketUuid: body.bitbucketUuid,
+          bitbucketLogin: body.bitbucketLogin,
+          bitbucketDisplayName: body.bitbucketDisplayName,
+          bitbucketEmail: body.bitbucketEmail,
+          bitbucketTokenEncrypted,
+          bitbucketRefreshTokenEncrypted,
+          bitbucketTokenExpiresAt: body.bitbucketTokenExpiresAt,
         }),
       },
       ctx
