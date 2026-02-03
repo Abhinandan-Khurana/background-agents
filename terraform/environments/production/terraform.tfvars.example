@@ -75,6 +75,23 @@ EOF
 github_app_installation_id = ""
 
 # =============================================================================
+# Bitbucket Credentials (Optional)
+# =============================================================================
+# Leave empty to disable Bitbucket integration.
+
+# Bitbucket OAuth Consumer (for user authentication)
+# Create at: https://bitbucket.org/workspace/settings/oauth-consumers/new
+# Required permissions: account (read), repository (read), pullrequest (write)
+bitbucket_client_id = ""
+bitbucket_client_secret = ""
+
+# Bitbucket Bot Account (for Git operations in sandboxes)
+# Create an App Password at: https://bitbucket.org/account/settings/app-passwords/
+# Required permissions: Repositories (read, write), Pull requests (read, write)
+bitbucket_bot_username = ""
+bitbucket_bot_app_password = ""
+
+# =============================================================================
 # Slack App Credentials (Optional)
 # =============================================================================
 # From Slack App dashboard: https://api.slack.com/apps

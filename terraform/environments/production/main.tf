@@ -83,6 +83,7 @@ module "control_plane_worker" {
 
   plain_text_bindings = [
     { name = "GITHUB_CLIENT_ID", value = var.github_client_id },
+    { name = "BITBUCKET_CLIENT_ID", value = var.bitbucket_client_id },
     { name = "WEB_APP_URL", value = local.web_app_url },
     { name = "WORKER_URL", value = local.control_plane_url },
     { name = "MODAL_WORKSPACE", value = var.modal_workspace },
@@ -91,6 +92,9 @@ module "control_plane_worker" {
 
   secrets = [
     { name = "GITHUB_CLIENT_SECRET", value = var.github_client_secret },
+    { name = "BITBUCKET_CLIENT_SECRET", value = var.bitbucket_client_secret },
+    { name = "BITBUCKET_BOT_USERNAME", value = var.bitbucket_bot_username },
+    { name = "BITBUCKET_BOT_APP_PASSWORD", value = var.bitbucket_bot_app_password },
     { name = "TOKEN_ENCRYPTION_KEY", value = var.token_encryption_key },
     { name = "MODAL_TOKEN_ID", value = var.modal_token_id },
     { name = "MODAL_TOKEN_SECRET", value = var.modal_token_secret },
@@ -203,6 +207,19 @@ module "web_app" {
       targets   = ["production", "preview"]
       sensitive = true
     },
+    # Bitbucket OAuth
+    {
+      key       = "BITBUCKET_CLIENT_ID"
+      value     = var.bitbucket_client_id
+      targets   = ["production", "preview"]
+      sensitive = false
+    },
+    {
+      key       = "BITBUCKET_CLIENT_SECRET"
+      value     = var.bitbucket_client_secret
+      targets   = ["production", "preview"]
+      sensitive = true
+    },
     # NextAuth
     {
       key       = "NEXTAUTH_URL"
@@ -299,6 +316,13 @@ module "modal_app" {
         GITHUB_APP_ID              = var.github_app_id
         GITHUB_APP_PRIVATE_KEY     = var.github_app_private_key
         GITHUB_APP_INSTALLATION_ID = var.github_app_installation_id
+      }
+    },
+    {
+      name = "bitbucket-bot"
+      values = {
+        BITBUCKET_BOT_USERNAME     = var.bitbucket_bot_username
+        BITBUCKET_BOT_APP_PASSWORD = var.bitbucket_bot_app_password
       }
     },
     {

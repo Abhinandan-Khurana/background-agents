@@ -88,6 +88,36 @@ variable "github_app_installation_id" {
 }
 
 # =============================================================================
+# Bitbucket Credentials
+# =============================================================================
+
+variable "bitbucket_client_id" {
+  description = "Bitbucket OAuth Consumer client ID"
+  type        = string
+  default     = ""
+}
+
+variable "bitbucket_client_secret" {
+  description = "Bitbucket OAuth Consumer client secret"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "bitbucket_bot_username" {
+  description = "Bitbucket Bot account username for Git operations"
+  type        = string
+  default     = ""
+}
+
+variable "bitbucket_bot_app_password" {
+  description = "Bitbucket Bot account app password for Git operations"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+# =============================================================================
 # Slack App Credentials
 # =============================================================================
 
