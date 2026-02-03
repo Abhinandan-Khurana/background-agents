@@ -102,8 +102,33 @@ BITBUCKET_BOT_APP_PASSWORD="<app-password>"
 
 Configure the provider. Bitbucket requires specific scopes to read repos and write PRs.
 
+**Note:** `next-auth` v4 does not include a built-in Bitbucket provider. A custom OAuth provider
+must be created. See `packages/web/src/lib/auth.ts` for the full implementation.
+
 ```typescript
-import BitbucketProvider from "next-auth/providers/bitbucket";
+import type { OAuthConfig } from "next-auth/providers/oauth";
+
+// Custom Bitbucket OAuth provider (not included in next-auth v4)
+function BitbucketProvider(options: {
+  clientId: string;
+  clientSecret: string;
+  authorization?: { params?: { scope?: string } };
+}): OAuthConfig<BitbucketProfile> {
+  return {
+    id: "bitbucket",
+    name: "Bitbucket",
+    type: "oauth",
+    authorization: {
+      url: "https://bitbucket.org/site/oauth2/authorize",
+      params: { response_type: "code", ...options.authorization?.params },
+    },
+    token: "https://bitbucket.org/site/oauth2/access_token",
+    userinfo: { url: "https://api.bitbucket.org/2.0/user", /* custom request handler */ },
+    profile(profile) { /* map to NextAuth user */ },
+    clientId: options.clientId,
+    clientSecret: options.clientSecret,
+  };
+}
 
 export const authOptions: AuthOptions = {
   providers: [
@@ -114,7 +139,7 @@ export const authOptions: AuthOptions = {
         params: {
           // repository:write - needed to create PRs (Bitbucket weirdness: PRs are part of repo write)
           // account - needed for user profile
-          scope: "repository:write account", 
+          scope: "repository:write account",
         },
       },
     }),
@@ -328,7 +353,7 @@ sequenceDiagram
 ## 8. Development Next Steps
 
 1. **Apply DB Migrations:** Run SQL to add `vcs_provider` and token columns.
-2. **Install SDKs:** Add `next-auth/providers/bitbucket`.
+2. **Implement Custom Bitbucket Provider:** Create a custom OAuth provider in `auth.ts` (next-auth v4 does not include one).
 3. **Implement Web Auth:** Update `sidebar-layout.tsx` and `auth/options.ts`.
 4. **Implement Control Plane:** Create `auth/bitbucket.ts` and update `durable-object.ts`.
 5. **Update Sandbox:** Deploy new `bridge.py` image with Bitbucket URL logic.

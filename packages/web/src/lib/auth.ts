@@ -1,7 +1,81 @@
 import type { NextAuthOptions } from "next-auth";
+import type { OAuthConfig } from "next-auth/providers/oauth";
 import GitHubProvider from "next-auth/providers/github";
-import BitbucketProvider from "next-auth/providers/bitbucket";
 import { checkAccessAllowed, parseAllowlist } from "./access-control";
+
+// Bitbucket profile type
+interface BitbucketProfile {
+  uuid: string;
+  username: string;
+  display_name: string;
+  links: {
+    avatar: {
+      href: string;
+    };
+  };
+  // Email comes from a separate endpoint
+}
+
+// Custom Bitbucket OAuth provider (not included in next-auth v4)
+function BitbucketProvider(options: {
+  clientId: string;
+  clientSecret: string;
+  authorization?: { params?: { scope?: string } };
+}): OAuthConfig<BitbucketProfile> {
+  return {
+    id: "bitbucket",
+    name: "Bitbucket",
+    type: "oauth",
+    authorization: {
+      url: "https://bitbucket.org/site/oauth2/authorize",
+      params: {
+        response_type: "code",
+        ...options.authorization?.params,
+      },
+    },
+    token: "https://bitbucket.org/site/oauth2/access_token",
+    userinfo: {
+      url: "https://api.bitbucket.org/2.0/user",
+      async request({ tokens, provider }) {
+        const profile = await fetch(provider.userinfo?.url as string, {
+          headers: {
+            Authorization: `Bearer ${tokens.access_token}`,
+          },
+        }).then((res) => res.json());
+
+        // Fetch email separately
+        const emails = await fetch(
+          "https://api.bitbucket.org/2.0/user/emails",
+          {
+            headers: {
+              Authorization: `Bearer ${tokens.access_token}`,
+            },
+          }
+        ).then((res) => res.json());
+
+        // Find primary email
+        const primaryEmail = emails.values?.find(
+          (e: { is_primary: boolean; email: string }) => e.is_primary
+        )?.email;
+
+        return {
+          ...profile,
+          email: primaryEmail,
+        };
+      },
+    },
+    profile(profile) {
+      return {
+        id: profile.uuid,
+        name: profile.display_name,
+        email: (profile as BitbucketProfile & { email?: string }).email ?? null,
+        image: profile.links?.avatar?.href,
+      };
+    },
+    clientId: options.clientId,
+    clientSecret: options.clientSecret,
+  };
+}
 
 // VCS Provider type
 export type VCSProvider = "github" | "bitbucket";

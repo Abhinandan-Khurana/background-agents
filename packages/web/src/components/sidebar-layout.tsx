@@ -102,13 +102,7 @@ function GitHubIcon() {
   );
 }
 
-function BitbucketIcon() {
-  return (
-    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-      <path d="M1.435 2.531C.669 2.531.025 3.167.025 3.939v.01l2.883 16.514c.132.747.837 1.283 1.612 1.283h14.938c.775 0 1.48-.536 1.612-1.283l2.883-16.513v-.01c0-.772-.644-1.408-1.41-1.408H1.435zm12.315 12.683h-3.654l-.993-5.18h5.543l-.896 5.18z" />
-    </svg>
-  );
-}
+
 
 function BitbucketIcon() {
   return (
