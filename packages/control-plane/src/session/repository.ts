@@ -499,6 +499,27 @@ export class SessionRepository {
     );
   }
 
+  updateParticipantBitbucketTokens(
+    participantId: string,
+    data: {
+      accessTokenEncrypted: string;
+      refreshTokenEncrypted: string;
+      expiresAt: number;
+    }
+  ): void {
+    this.sql.exec(
+      `UPDATE participants SET
+         bitbucket_access_token_encrypted = ?,
+         bitbucket_refresh_token_encrypted = ?,
+         bitbucket_token_expires_at = ?
+       WHERE id = ?`,
+      data.accessTokenEncrypted,
+      data.refreshTokenEncrypted,
+      data.expiresAt,
+      participantId
+    );
+  }
+
   updateParticipantWsToken(participantId: string, tokenHash: string, createdAt: number): void {
     this.sql.exec(
       `UPDATE participants SET ws_auth_token = ?, ws_token_created_at = ? WHERE id = ?`,
