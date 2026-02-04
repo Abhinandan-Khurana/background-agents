@@ -46,6 +46,23 @@ class VCSCredentials(NamedTuple):
     token: str
     source: str  # For logging: "bot", "command", "env", "none"
 
+    def redact_from(self, text: str) -> str:
+        """Redact credentials from text to prevent token leakage in logs/errors.
+
+        Args:
+            text: String that may contain sensitive credentials.
+
+        Returns:
+            String with credentials replaced by [REDACTED].
+        """
+        result = text
+        if self.token and self.token in result:
+            result = result.replace(self.token, "[REDACTED]")
+        if self.username and self.username not in ("x-access-token", "x-token-auth") and self.username in result:
+            # Only redact username if it's not a standard git auth pattern
+            result = result.replace(self.username, "[REDACTED]")
+        return result
+
 
 class OpenCodeIdentifier:
     """
@@ -1131,6 +1148,9 @@ class AgentBridge:
         """Handle push command - push current branch to remote.
 
         Supports both GitHub and Bitbucket based on vcsProvider.
+
+        Security: Uses GIT_ASKPASS to pass credentials securely instead of
+        embedding them in URLs, preventing exposure via process listing.
         """
         branch_name = cmd.get("branchName", "")
         repo_owner = cmd.get("repoOwner") or os.environ.get("REPO_OWNER", "")
@@ -1175,45 +1195,86 @@ class AgentBridge:
                 )
                 return
 
-            push_url = self._get_git_remote_url(vcs_provider, vcs_creds, repo_owner, repo_name)
-
-            result = await asyncio.create_subprocess_exec(
-                "git",
-                "push",
-                push_url,
-                refspec,
-                "-f",
-                cwd=repo_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            _stdout, _stderr = await result.communicate()
-
-            if result.returncode != 0:
-                self.log.warn("git.push_failed", branch_name=branch_name, vcs_provider=vcs_provider)
-                await self._send_event(
-                    {
-                        "type": "push_error",
-                        "error": "Push failed - authentication may be required",
-                        "branchName": branch_name,
-                    }
-                )
+            # Construct remote URL without credentials (credentials passed via GIT_ASKPASS)
+            if vcs_provider == "bitbucket":
+                remote_url = f"https://bitbucket.org/{repo_owner}/{repo_name}.git"
             else:
-                self.log.info("git.push_complete", branch_name=branch_name, vcs_provider=vcs_provider)
-                await self._send_event(
-                    {
-                        "type": "push_complete",
-                        "branchName": branch_name,
-                    }
+                remote_url = f"https://github.com/{repo_owner}/{repo_name}.git"
+
+            # Create a temporary askpass script to provide credentials securely
+            # This avoids embedding tokens in URLs (visible via `ps aux`)
+            askpass_script = None
+            try:
+                askpass_script = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".sh", delete=False, prefix="git_askpass_"
                 )
+                # Script outputs username for "Username" prompts, password for "Password" prompts
+                askpass_script.write(f"""#!/bin/bash
+if [[ "$1" == *"Username"* ]]; then
+    echo "{vcs_creds.username}"
+else
+    echo "{vcs_creds.token}"
+fi
+""")
+                askpass_script.close()
+                os.chmod(askpass_script.name, 0o700)
+
+                # Set up environment with GIT_ASKPASS
+                git_env = os.environ.copy()
+                git_env["GIT_ASKPASS"] = askpass_script.name
+                git_env["GIT_TERMINAL_PROMPT"] = "0"
+
+                result = await asyncio.create_subprocess_exec(
+                    "git",
+                    "push",
+                    remote_url,
+                    refspec,
+                    "-f",
+                    cwd=repo_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=git_env,
+                )
+
+                _stdout, _stderr = await result.communicate()
+
+                if result.returncode != 0:
+                    # Redact any credentials that might appear in stderr
+                    stderr_safe = vcs_creds.redact_from(_stderr.decode("utf-8", errors="replace"))
+                    self.log.warn(
+                        "git.push_failed",
+                        branch_name=branch_name,
+                        vcs_provider=vcs_provider,
+                        stderr=stderr_safe,
+                    )
+                    await self._send_event(
+                        {
+                            "type": "push_error",
+                            "error": "Push failed - authentication may be required",
+                            "branchName": branch_name,
+                        }
+                    )
+                else:
+                    self.log.info("git.push_complete", branch_name=branch_name, vcs_provider=vcs_provider)
+                    await self._send_event(
+                        {
+                            "type": "push_complete",
+                            "branchName": branch_name,
+                        }
+                    )
+            finally:
+                # Clean up askpass script
+                if askpass_script and os.path.exists(askpass_script.name):
+                    os.unlink(askpass_script.name)
 
         except Exception as e:
+            # Redact credentials from exception message to prevent token leakage
+            error_msg = vcs_creds.redact_from(str(e))
             self.log.error("git.push_error", exc=e, branch_name=branch_name, vcs_provider=vcs_provider)
             await self._send_event(
                 {
                     "type": "push_error",
-                    "error": str(e),
+                    "error": error_msg,
                     "branchName": branch_name,
                 }
             )

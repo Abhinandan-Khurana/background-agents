@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import signal
+import tempfile
 import time
 from pathlib import Path
 
@@ -84,14 +85,10 @@ class SandboxSupervisor:
         )
 
     def _get_clone_url(self) -> str:
-        """Get authenticated clone URL based on VCS provider."""
+        """Get public clone URL (credentials passed via GIT_ASKPASS for security)."""
         if self.vcs_provider == "bitbucket":
-            if self.bitbucket_bot_username and self.bitbucket_bot_app_password:
-                return f"https://{self.bitbucket_bot_username}:{self.bitbucket_bot_app_password}@bitbucket.org/{self.repo_owner}/{self.repo_name}.git"
             return f"https://bitbucket.org/{self.repo_owner}/{self.repo_name}.git"
         else:  # github
-            if self.github_app_token:
-                return f"https://x-access-token:{self.github_app_token}@github.com/{self.repo_owner}/{self.repo_name}.git"
             return f"https://github.com/{self.repo_owner}/{self.repo_name}.git"
 
     def _get_public_clone_url(self) -> str:
@@ -101,9 +98,37 @@ class SandboxSupervisor:
         else:  # github
             return f"https://github.com/{self.repo_owner}/{self.repo_name}.git"
 
+    def _get_git_credentials(self) -> tuple[str, str]:
+        """Get git credentials (username, token) based on VCS provider.
+
+        Returns:
+            Tuple of (username, token). Empty strings if no credentials available.
+        """
+        if self.vcs_provider == "bitbucket":
+            if self.bitbucket_bot_username and self.bitbucket_bot_app_password:
+                return (self.bitbucket_bot_username, self.bitbucket_bot_app_password)
+            return ("", "")
+        else:  # github
+            if self.github_app_token:
+                return ("x-access-token", self.github_app_token)
+            return ("", "")
+
+    def _redact_credentials(self, text: str) -> str:
+        """Redact git credentials from text to prevent token leakage in logs."""
+        result = text
+        username, token = self._get_git_credentials()
+        if token and token in result:
+            result = result.replace(token, "[REDACTED]")
+        if username and username not in ("x-access-token", "x-token-auth") and username in result:
+            result = result.replace(username, "[REDACTED]")
+        return result
+
     async def perform_git_sync(self) -> bool:
         """
         Clone repository if needed, then synchronize with latest changes.
+
+        Security: Uses GIT_ASKPASS to pass credentials securely instead of
+        embedding them in URLs, preventing exposure via process listing.
 
         Returns:
             True if sync completed successfully, False otherwise
@@ -118,61 +143,79 @@ class SandboxSupervisor:
             has_bitbucket_creds=bool(self.bitbucket_bot_username and self.bitbucket_bot_app_password),
         )
 
-        # Clone the repository if it doesn't exist
-        if not self.repo_path.exists():
-            if not self.repo_owner or not self.repo_name:
-                self.log.info("git.skip_clone", reason="no_repo_configured")
-                self.git_sync_complete.set()
-                return True
+        # Get credentials for GIT_ASKPASS
+        username, token = self._get_git_credentials()
+        has_credentials = bool(username and token)
 
-            self.log.info(
-                "git.clone_start",
-                repo_owner=self.repo_owner,
-                repo_name=self.repo_name,
-                vcs_provider=self.vcs_provider,
-                authenticated=bool(self._get_clone_url() != self._get_public_clone_url()),
-            )
+        # Create askpass script if we have credentials
+        askpass_script = None
+        git_env = os.environ.copy()
 
-            clone_url = self._get_clone_url()
-
-            result = await asyncio.create_subprocess_exec(
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                clone_url,
-                str(self.repo_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await result.communicate()
-
-            if result.returncode != 0:
-                self.log.error(
-                    "git.clone_error",
-                    stderr=stderr.decode(),
-                    exit_code=result.returncode,
+        if has_credentials:
+            try:
+                askpass_script = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".sh", delete=False, prefix="git_askpass_"
                 )
-                self.git_sync_complete.set()
-                return False
-
-            self.log.info("git.clone_complete", repo_path=str(self.repo_path))
+                askpass_script.write(f"""#!/bin/bash
+if [[ "$1" == *"Username"* ]]; then
+    echo "{username}"
+else
+    echo "{token}"
+fi
+""")
+                askpass_script.close()
+                os.chmod(askpass_script.name, 0o700)
+                git_env["GIT_ASKPASS"] = askpass_script.name
+                git_env["GIT_TERMINAL_PROMPT"] = "0"
+            except Exception as e:
+                self.log.warn("git.askpass_setup_failed", error=str(e))
+                # Continue without askpass - will fall back to public clone
 
         try:
-            # Configure remote URL with auth token if available
-            auth_url = self._get_clone_url()
-            await asyncio.create_subprocess_exec(
-                "git",
-                "remote",
-                "set-url",
-                "origin",
-                auth_url,
-                cwd=self.repo_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            # Clone the repository if it doesn't exist
+            if not self.repo_path.exists():
+                if not self.repo_owner or not self.repo_name:
+                    self.log.info("git.skip_clone", reason="no_repo_configured")
+                    self.git_sync_complete.set()
+                    return True
 
-            # Fetch latest changes
+                self.log.info(
+                    "git.clone_start",
+                    repo_owner=self.repo_owner,
+                    repo_name=self.repo_name,
+                    vcs_provider=self.vcs_provider,
+                    authenticated=has_credentials,
+                )
+
+                clone_url = self._get_clone_url()
+
+                result = await asyncio.create_subprocess_exec(
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    clone_url,
+                    str(self.repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=git_env,
+                )
+                stdout, stderr = await result.communicate()
+
+                if result.returncode != 0:
+                    # Redact credentials from stderr before logging
+                    stderr_safe = self._redact_credentials(stderr.decode())
+                    self.log.error(
+                        "git.clone_error",
+                        stderr=stderr_safe,
+                        exit_code=result.returncode,
+                    )
+                    self.git_sync_complete.set()
+                    return False
+
+                self.log.info("git.clone_complete", repo_path=str(self.repo_path))
+
+            # Fetch latest changes (no need to set remote URL since we use GIT_ASKPASS)
             result = await asyncio.create_subprocess_exec(
                 "git",
                 "fetch",
@@ -180,14 +223,16 @@ class SandboxSupervisor:
                 cwd=self.repo_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=git_env,
             )
             await result.wait()
 
             if result.returncode != 0:
                 stderr = await result.stderr.read() if result.stderr else b""
+                stderr_safe = self._redact_credentials(stderr.decode())
                 self.log.error(
                     "git.fetch_error",
-                    stderr=stderr.decode(),
+                    stderr=stderr_safe,
                     exit_code=result.returncode,
                 )
                 return False
@@ -237,9 +282,19 @@ class SandboxSupervisor:
             return True
 
         except Exception as e:
-            self.log.error("git.sync_error", exc=e)
+            # Redact credentials from exception message
+            error_safe = self._redact_credentials(str(e))
+            self.log.error("git.sync_error", error=error_safe)
             self.git_sync_complete.set()  # Allow agent to proceed anyway
             return False
+
+        finally:
+            # Clean up askpass script
+            if askpass_script and os.path.exists(askpass_script.name):
+                try:
+                    os.unlink(askpass_script.name)
+                except OSError:
+                    pass
 
     async def start_opencode(self) -> None:
         """Start OpenCode server with configuration."""
