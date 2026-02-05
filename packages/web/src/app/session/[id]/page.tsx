@@ -389,6 +389,7 @@ function SessionContent({
     const filteredEvents: SandboxEvent[] = [];
     const seenToolCalls = new Map<string, number>();
     const seenCompletions = new Set<string>();
+    const seenTokens = new Map<string, number>();
 
     for (const event of events as SandboxEvent[]) {
       if (event.type === "tool_call" && event.callId) {
@@ -406,13 +407,21 @@ function SessionContent({
           seenCompletions.add(event.messageId);
           filteredEvents.push(event);
         }
+      } else if (event.type === "token" && event.messageId) {
+        // Deduplicate tokens by messageId - keep latest at its chronological position
+        const existingIdx = seenTokens.get(event.messageId);
+        if (existingIdx !== undefined) {
+          filteredEvents[existingIdx] = null as unknown as SandboxEvent;
+        }
+        seenTokens.set(event.messageId, filteredEvents.length);
+        filteredEvents.push(event);
       } else {
-        // All other events (token, user_message, git_sync, etc.) - add as-is
+        // All other events (user_message, git_sync, etc.) - add as-is
         filteredEvents.push(event);
       }
     }
 
-    return groupEvents(filteredEvents);
+    return groupEvents(filteredEvents.filter(Boolean) as SandboxEvent[]);
   }, [events]);
 
   return (
