@@ -26,12 +26,14 @@ import {
   type IdGenerator,
 } from "../sandbox/lifecycle/manager";
 import {
-  createGitHubProvider,
+  createSourceControlProvider as createSourceControlProviderImpl,
   SourceControlProviderError,
   type SourceControlProvider,
   type SourceControlAuthContext,
+  type GitPushSpec,
 } from "../source-control";
-import { generateBranchName } from "@open-inspect/shared";
+import { resolveHeadBranchForPr } from "../source-control/branch-resolution";
+import { generateBranchName, type ManualPullRequestArtifactMetadata } from "@open-inspect/shared";
 import { DEFAULT_MODEL, isValidModel, extractProviderAndModel } from "../utils/models";
 import type {
   Env,
@@ -45,7 +47,7 @@ import type {
   MessageSource,
   ParticipantRole,
 } from "../types";
-import type { SessionRow, ParticipantRow, SandboxRow, SandboxCommand } from "./types";
+import type { SessionRow, ParticipantRow, ArtifactRow, SandboxRow, SandboxCommand } from "./types";
 import { SessionRepository } from "./repository";
 import { RepoSecretsStore } from "../db/repo-secrets";
 
@@ -187,8 +189,11 @@ export class SessionDO extends DurableObject<Env> {
   private createSourceControlProvider(): SourceControlProvider {
     const appConfig = getGitHubAppConfig(this.env);
 
-    return createGitHubProvider({
-      appConfig: appConfig ?? undefined,
+    return createSourceControlProviderImpl({
+      provider: "github",
+      github: {
+        appConfig: appConfig ?? undefined,
+      },
     });
   }
 
@@ -1231,9 +1236,7 @@ export class SessionDO extends DurableObject<Env> {
    */
   private async pushBranchToRemote(
     branchName: string,
-    repoOwner: string,
-    repoName: string,
-    githubToken?: string
+    pushSpec: GitPushSpec
   ): Promise<{ success: true } | { success: false; error: string }> {
     const sandboxWs = this.getSandboxWebSocket();
 
@@ -1260,16 +1263,11 @@ export class SessionDO extends DurableObject<Env> {
       }, 180000);
     });
 
-    // Tell sandbox to push the current branch
-    // Pass GitHub App token for authentication (sandbox uses for git push)
-    // User's OAuth token is NOT sent to sandbox - only used server-side for PR API
+    // Tell sandbox to push the branch using provider-generated transport details.
     this.log.info("Sending push command", { branch_name: branchName });
     this.safeSend(sandboxWs, {
       type: "push",
-      branchName,
-      repoOwner,
-      repoName,
-      githubToken,
+      pushSpec,
     });
 
     // Wait for push_complete or push_error event
@@ -1905,12 +1903,12 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   /**
-   * Get the prompting user for PR creation.
+   * Get the prompting participant for PR creation.
    * Returns the participant who triggered the currently processing message.
    */
-  private async getPromptingUserForPR(): Promise<
-    | { user: ParticipantRow; error?: never; status?: never }
-    | { user?: never; error: string; status: number }
+  private async getPromptingParticipantForPR(): Promise<
+    | { participant: ParticipantRow; error?: never; status?: never }
+    | { participant?: never; error: string; status: number }
   > {
     // Find the currently processing message
     const processingMessage = this.repository.getProcessingMessageAuthor();
@@ -1926,30 +1924,46 @@ export class SessionDO extends DurableObject<Env> {
     const participantId = processingMessage.author_id;
 
     // Get the participant record
-    let participant = this.repository.getParticipantById(participantId);
+    const participant = this.repository.getParticipantById(participantId);
 
     if (!participant) {
       this.log.warn("PR creation failed: participant not found", { participantId });
       return { error: "User not found. Please re-authenticate.", status: 401 };
     }
 
-    if (!participant.github_access_token_encrypted) {
-      this.log.warn("PR creation failed: no GitHub token", { userId: participant.user_id });
-      return {
-        error:
-          "Your GitHub token is not available for PR creation. Please reconnect to the session to re-authenticate.",
-        status: 401,
-      };
+    return { participant };
+  }
+
+  /**
+   * Resolve the prompting participant's OAuth credentials for API-based PR creation.
+   * Returns `auth: null` when no user OAuth token is available (manual PR fallback).
+   */
+  private async resolvePromptingUserAuthForPR(participant: ParticipantRow): Promise<
+    | {
+        participant: ParticipantRow;
+        auth: SourceControlAuthContext | null;
+        error?: never;
+        status?: never;
+      }
+    | { participant?: never; auth?: never; error: string; status: number }
+  > {
+    let resolvedParticipant = participant;
+
+    if (!resolvedParticipant.github_access_token_encrypted) {
+      this.log.info("PR creation: prompting user has no OAuth token, using manual fallback", {
+        user_id: resolvedParticipant.user_id,
+      });
+      return { participant: resolvedParticipant, auth: null };
     }
 
-    if (this.isGitHubTokenExpired(participant)) {
+    if (this.isGitHubTokenExpired(resolvedParticipant)) {
       this.log.warn("GitHub token expired, attempting server-side refresh", {
-        userId: participant.user_id,
+        userId: resolvedParticipant.user_id,
       });
 
-      const refreshed = await this.refreshParticipantToken(participant);
+      const refreshed = await this.refreshParticipantToken(resolvedParticipant);
       if (refreshed) {
-        participant = refreshed;
+        resolvedParticipant = refreshed;
       } else {
         return {
           error:
@@ -1959,7 +1973,33 @@ export class SessionDO extends DurableObject<Env> {
       }
     }
 
-    return { user: participant };
+    if (!resolvedParticipant.github_access_token_encrypted) {
+      return { participant: resolvedParticipant, auth: null };
+    }
+
+    try {
+      const accessToken = await decryptToken(
+        resolvedParticipant.github_access_token_encrypted,
+        this.env.TOKEN_ENCRYPTION_KEY
+      );
+
+      return {
+        participant: resolvedParticipant,
+        auth: {
+          authType: "oauth",
+          token: accessToken,
+        },
+      };
+    } catch (error) {
+      this.log.error("Failed to decrypt GitHub token for PR creation", {
+        user_id: resolvedParticipant.user_id,
+        error: error instanceof Error ? error : String(error),
+      });
+      return {
+        error: "Failed to process GitHub token for PR creation.",
+        status: 500,
+      };
+    }
   }
 
   // HTTP handlers
@@ -2238,7 +2278,7 @@ export class SessionDO extends DurableObject<Env> {
         id: a.id,
         type: a.type,
         url: a.url,
-        metadata: a.metadata ? JSON.parse(a.metadata) : null,
+        metadata: this.parseArtifactMetadata(a),
         createdAt: a.created_at,
       })),
     });
@@ -2280,15 +2320,16 @@ export class SessionDO extends DurableObject<Env> {
 
   /**
    * Handle PR creation request.
-   * 1. Get prompting user's GitHub token (required, no fallback)
-   * 2. Send push command to sandbox
-   * 3. Create PR using GitHub API
+   * 1. Resolve prompting participant and branch metadata
+   * 2. Push branch to remote via provider push auth
+   * 3. Create PR via OAuth token, or return manual PR URL fallback
    */
   private async handleCreatePR(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       title: string;
       body: string;
       baseBranch?: string;
+      headBranch?: string;
     };
 
     const session = this.getSession();
@@ -2296,40 +2337,32 @@ export class SessionDO extends DurableObject<Env> {
       return Response.json({ error: "Session not found" }, { status: 404 });
     }
 
-    // Get the prompting user who will create the PR
-    const promptingUser = await this.getPromptingUserForPR();
-    if (!promptingUser.user) {
-      return Response.json({ error: promptingUser.error }, { status: promptingUser.status });
+    const promptingParticipantResult = await this.getPromptingParticipantForPR();
+    if (!promptingParticipantResult.participant) {
+      return Response.json(
+        { error: promptingParticipantResult.error },
+        { status: promptingParticipantResult.status }
+      );
     }
 
-    this.log.info("Creating PR", { user_id: promptingUser.user.user_id });
-
-    const user = promptingUser.user;
+    const promptingParticipant = promptingParticipantResult.participant;
+    this.log.info("Creating PR", { user_id: promptingParticipant.user_id });
 
     try {
-      // Decrypt the user's GitHub token at the session layer
-      const accessToken = await decryptToken(
-        user.github_access_token_encrypted!,
-        this.env.TOKEN_ENCRYPTION_KEY
-      );
-
-      // Build auth context with plain token for provider
-      const userAuth: SourceControlAuthContext = {
-        authType: "oauth",
-        token: accessToken,
-      };
-      // Get repository info via provider
-      const repoInfo = await this.sourceControlProvider.getRepository(userAuth, {
-        owner: session.repo_owner,
-        name: session.repo_name,
-      });
-
-      const baseBranch = body.baseBranch || repoInfo.defaultBranch;
       const sessionId = session.session_name || session.id;
-      const headBranch = generateBranchName(sessionId);
+      const generatedHeadBranch = generateBranchName(sessionId);
 
-      // Generate push auth via provider (GitHub App token, not user token)
-      // User token is only used for PR API call below
+      const initialArtifacts = this.repository.listArtifacts();
+      const existingPrArtifact = initialArtifacts.find((artifact) => artifact.type === "pr");
+      if (existingPrArtifact) {
+        return Response.json(
+          { error: "A pull request has already been created for this session." },
+          { status: 409 }
+        );
+      }
+
+      // Generate push auth via provider app credentials (not user token)
+      // User token (if available) is only used for PR API call below
       let pushAuth;
       try {
         pushAuth = await this.sourceControlProvider.generatePushAuth();
@@ -2345,16 +2378,73 @@ export class SessionDO extends DurableObject<Env> {
         return Response.json({ error: errorMessage }, { status: 500 });
       }
 
+      // Resolve repository metadata with app auth so this still works for Slack sessions
+      const appAuth: SourceControlAuthContext = {
+        authType: "app",
+        token: pushAuth.token,
+      };
+      const repoInfo = await this.sourceControlProvider.getRepository(appAuth, {
+        owner: session.repo_owner,
+        name: session.repo_name,
+      });
+      const baseBranch = body.baseBranch || repoInfo.defaultBranch;
+      const branchResolution = resolveHeadBranchForPr({
+        requestedHeadBranch: body.headBranch,
+        sessionBranchName: session.branch_name,
+        generatedBranchName: generatedHeadBranch,
+        baseBranch,
+      });
+      const headBranch = branchResolution.headBranch;
+      this.log.info("Resolved PR head branch", {
+        requested_head_branch: body.headBranch ?? null,
+        session_branch_name: session.branch_name,
+        generated_head_branch: generatedHeadBranch,
+        resolved_head_branch: headBranch,
+        resolution_source: branchResolution.source,
+        base_branch: baseBranch,
+      });
+      const pushSpec = this.sourceControlProvider.buildGitPushSpec({
+        owner: session.repo_owner,
+        name: session.repo_name,
+        sourceRef: "HEAD",
+        targetBranch: headBranch,
+        auth: pushAuth,
+        force: true,
+      });
+
       // Push branch to remote via sandbox (session-layer coordination)
-      const pushResult = await this.pushBranchToRemote(
-        headBranch,
-        session.repo_owner,
-        session.repo_name,
-        pushAuth.token
-      );
+      const pushResult = await this.pushBranchToRemote(headBranch, pushSpec);
 
       if (!pushResult.success) {
         return Response.json({ error: pushResult.error }, { status: 500 });
+      }
+
+      // Update session with branch name after push succeeds
+      this.repository.updateSessionBranch(session.id, headBranch);
+
+      // Re-check artifacts after async work to avoid stale reads on retries/interleaving.
+      const latestArtifacts = this.repository.listArtifacts();
+      const latestPrArtifact = latestArtifacts.find((artifact) => artifact.type === "pr");
+      if (latestPrArtifact) {
+        return Response.json(
+          { error: "A pull request has already been created for this session." },
+          { status: 409 }
+        );
+      }
+
+      const authResolution = await this.resolvePromptingUserAuthForPR(promptingParticipant);
+      if ("error" in authResolution) {
+        return this.buildManualPrFallbackResponse(
+          session,
+          headBranch,
+          baseBranch,
+          latestArtifacts,
+          authResolution.error
+        );
+      }
+
+      if (!authResolution.auth) {
+        return this.buildManualPrFallbackResponse(session, headBranch, baseBranch, latestArtifacts);
       }
 
       // Append session link footer to agent's PR body
@@ -2362,8 +2452,8 @@ export class SessionDO extends DurableObject<Env> {
       const sessionUrl = `${webAppUrl}/session/${sessionId}`;
       const fullBody = body.body + `\n\n---\n*Created with [Open-Inspect](${sessionUrl})*`;
 
-      // Create the PR via provider (using the prompting user's token)
-      const prResult = await this.sourceControlProvider.createPullRequest(userAuth, {
+      // Create the PR via provider (using the prompting user's OAuth token)
+      const prResult = await this.sourceControlProvider.createPullRequest(authResolution.auth, {
         repository: repoInfo,
         title: body.title,
         body: fullBody,
@@ -2386,9 +2476,6 @@ export class SessionDO extends DurableObject<Env> {
         }),
         createdAt: now,
       });
-
-      // Update session with branch name
-      this.repository.updateSessionBranch(session.id, headBranch);
 
       // Broadcast PR creation to all clients
       this.broadcast({
@@ -2421,6 +2508,139 @@ export class SessionDO extends DurableObject<Env> {
         { status: 500 }
       );
     }
+  }
+
+  private parseArtifactMetadata(
+    artifact: Pick<ArtifactRow, "id" | "metadata">
+  ): Record<string, unknown> | null {
+    if (!artifact.metadata) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(artifact.metadata) as Record<string, unknown>;
+    } catch (error) {
+      this.log.warn("Invalid artifact metadata JSON", {
+        artifact_id: artifact.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private getExistingManualBranchArtifact(
+    artifacts: ArtifactRow[],
+    headBranch: string
+  ): { artifact: ArtifactRow; metadata: Record<string, unknown> } | null {
+    for (const artifact of artifacts) {
+      if (artifact.type !== "branch") {
+        continue;
+      }
+
+      const metadata = this.parseArtifactMetadata(artifact);
+      if (!metadata) {
+        continue;
+      }
+
+      if (metadata.mode === "manual_pr" && metadata.head === headBranch) {
+        return { artifact, metadata };
+      }
+    }
+
+    return null;
+  }
+
+  private getCreatePrUrlFromManualArtifact(
+    existing: { artifact: ArtifactRow; metadata: Record<string, unknown> },
+    fallbackUrl: string
+  ): string {
+    const metadataUrl = existing.metadata.createPrUrl;
+    if (typeof metadataUrl === "string" && metadataUrl.length > 0) {
+      return metadataUrl;
+    }
+
+    if (existing.artifact.url && existing.artifact.url.length > 0) {
+      return existing.artifact.url;
+    }
+
+    return fallbackUrl;
+  }
+
+  private buildManualPrFallbackResponse(
+    session: SessionRow,
+    headBranch: string,
+    baseBranch: string,
+    artifacts: ArtifactRow[],
+    reason?: string
+  ): Response {
+    const manualCreatePrUrl = this.sourceControlProvider.buildManualPullRequestUrl({
+      owner: session.repo_owner,
+      name: session.repo_name,
+      sourceBranch: headBranch,
+      targetBranch: baseBranch,
+    });
+
+    const existingManualArtifact = this.getExistingManualBranchArtifact(artifacts, headBranch);
+    if (existingManualArtifact) {
+      const createPrUrl = this.getCreatePrUrlFromManualArtifact(
+        existingManualArtifact,
+        manualCreatePrUrl
+      );
+      this.log.info("Using manual PR fallback", {
+        head_branch: headBranch,
+        base_branch: baseBranch,
+        session_id: session.session_name || session.id,
+        existing_artifact_id: existingManualArtifact.artifact.id,
+        reason: reason ?? "missing_oauth_token",
+      });
+      return Response.json({
+        status: "manual",
+        createPrUrl,
+        headBranch,
+        baseBranch,
+      });
+    }
+
+    const artifactId = generateId();
+    const now = Date.now();
+    const metadata: ManualPullRequestArtifactMetadata = {
+      head: headBranch,
+      base: baseBranch,
+      mode: "manual_pr",
+      createPrUrl: manualCreatePrUrl,
+      provider: this.sourceControlProvider.name,
+    };
+    this.repository.createArtifact({
+      id: artifactId,
+      type: "branch",
+      url: manualCreatePrUrl,
+      metadata: JSON.stringify(metadata),
+      createdAt: now,
+    });
+
+    this.broadcast({
+      type: "artifact_created",
+      artifact: {
+        id: artifactId,
+        type: "branch",
+        url: manualCreatePrUrl,
+      },
+    });
+
+    this.log.info("Using manual PR fallback", {
+      head_branch: headBranch,
+      base_branch: baseBranch,
+      session_id: session.session_name || session.id,
+      artifact_id: artifactId,
+      reason: reason ?? "missing_oauth_token",
+    });
+
+    return Response.json({
+      status: "manual",
+      createPrUrl: manualCreatePrUrl,
+      headBranch,
+      baseBranch,
+    });
   }
 
   /**

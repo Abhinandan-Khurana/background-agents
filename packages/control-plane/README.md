@@ -70,6 +70,18 @@ The control plane provides:
 | `/sessions/:id/archive`      | POST      | Archive session          |
 | `/sessions/:id/unarchive`    | POST      | Unarchive session        |
 
+### Create PR Payload
+
+`POST /sessions/:id/pr` accepts:
+
+- `title` (required)
+- `body` (required)
+- `baseBranch` (optional)
+- `headBranch` (optional)
+
+When `headBranch` is omitted, control-plane resolves it from session state and finally falls back to
+the generated `open-inspect/<session>` branch.
+
 ### Repositories
 
 | Endpoint                           | Method | Description          |
@@ -186,6 +198,10 @@ The system uses two types of GitHub tokens:
 | ---------------- | ----------- | ---------------- | -------------------------------- |
 | GitHub App Token | Clone, push | Yes (ephemeral)  | All repos where App is installed |
 | User OAuth Token | Create PRs  | No (server-only) | User's accessible repos          |
+
+If a `create-pr` request is triggered by a participant without a user OAuth token (for example,
+Slack-created sessions), the control-plane still pushes the branch with the GitHub App token and
+returns a manual GitHub `pull/new` URL instead of failing the request.
 
 ### Why This Matters
 
