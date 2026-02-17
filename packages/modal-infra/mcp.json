@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "raygun": {
+      "command": "npx",
+      "args": ["-y", "@raygun/mcp-server"],
+      "env": {
+        "RAYGUN_APPLICATION_ID": "${RAYGUN_APPLICATION_ID}"
+      }
+    }
+  }
+}

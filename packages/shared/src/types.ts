@@ -1,0 +1,267 @@
+/**
+ * Shared type definitions used across Open-Inspect packages.
+ */
+
+// Session states
+export type SessionStatus = "created" | "active" | "completed" | "archived";
+export type SandboxStatus =
+  | "pending"
+  | "warming"
+  | "syncing"
+  | "ready"
+  | "running"
+  | "stopped"
+  | "failed";
+export type GitSyncStatus = "pending" | "in_progress" | "completed" | "failed";
+export type MessageStatus = "pending" | "processing" | "completed" | "failed";
+export type MessageSource = "web" | "slack" | "extension" | "github";
+export type ArtifactType = "pr" | "screenshot" | "preview" | "branch";
+export type EventType = "tool_call" | "tool_result" | "token" | "error" | "git_sync";
+
+// User info for commit attribution
+export interface GitUser {
+  name: string;
+  email: string;
+}
+
+// Participant in a session
+export interface SessionParticipant {
+  id: string;
+  userId: string;
+  githubLogin: string | null;
+  githubName: string | null;
+  githubEmail: string | null;
+  role: "owner" | "member";
+}
+
+// Session state
+export interface Session {
+  id: string;
+  title: string | null;
+  repoOwner: string;
+  repoName: string;
+  repoDefaultBranch: string;
+  branchName: string | null;
+  baseSha: string | null;
+  currentSha: string | null;
+  opencodeSessionId: string | null;
+  status: SessionStatus;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// Message in a session
+export interface SessionMessage {
+  id: string;
+  authorId: string;
+  content: string;
+  source: MessageSource;
+  attachments: Attachment[] | null;
+  status: MessageStatus;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+}
+
+// Attachment to a message
+export interface Attachment {
+  type: "file" | "image" | "url";
+  name: string;
+  url?: string;
+  content?: string;
+  mimeType?: string;
+}
+
+// Agent event
+export interface AgentEvent {
+  id: string;
+  type: EventType;
+  data: Record<string, unknown>;
+  messageId: string | null;
+  createdAt: number;
+}
+
+// Artifact created by session
+export interface SessionArtifact {
+  id: string;
+  type: ArtifactType;
+  url: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: number;
+}
+
+// Pull request info
+export interface PullRequest {
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  state: "open" | "closed" | "merged";
+  headRef: string;
+  baseRef: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Sandbox event from Modal
+export interface SandboxEvent {
+  type: string;
+  sandboxId: string;
+  timestamp: number;
+  messageId?: string;
+  content?: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  callId?: string;
+  result?: string;
+  error?: string;
+  status?: string;
+  sha?: string;
+  success?: boolean;
+  artifactType?: string;
+  url?: string;
+  metadata?: Record<string, unknown>;
+  author?: {
+    participantId: string;
+    name: string;
+    avatar?: string;
+  };
+}
+
+// WebSocket message types
+export type ClientMessage =
+  | { type: "ping" }
+  | { type: "subscribe"; token: string; clientId: string }
+  | { type: "prompt"; content: string; attachments?: Attachment[] }
+  | { type: "stop" }
+  | { type: "typing" }
+  | { type: "presence"; status: "active" | "idle"; cursor?: { line: number; file: string } };
+
+export type ServerMessage =
+  | { type: "pong"; timestamp: number }
+  | {
+      type: "subscribed";
+      sessionId: string;
+      state: SessionState;
+      participantId: string;
+      participant?: { participantId: string; name: string; avatar?: string };
+    }
+  | { type: "prompt_queued"; messageId: string; position: number }
+  | { type: "sandbox_event"; event: SandboxEvent }
+  | { type: "presence_sync"; participants: ParticipantPresence[] }
+  | { type: "presence_update"; participants: ParticipantPresence[] }
+  | { type: "presence_leave"; userId: string }
+  | { type: "sandbox_warming" }
+  | { type: "sandbox_ready" }
+  | { type: "error"; code: string; message: string };
+
+// Session state sent to clients
+export interface SessionState {
+  id: string;
+  title: string | null;
+  repoOwner: string;
+  repoName: string;
+  branchName: string | null;
+  status: SessionStatus;
+  sandboxStatus: SandboxStatus;
+  messageCount: number;
+  createdAt: number;
+}
+
+// Participant presence info
+export interface ParticipantPresence {
+  participantId: string;
+  userId: string;
+  name: string;
+  avatar?: string;
+  status: "active" | "idle" | "away";
+  lastSeen: number;
+}
+
+// Repository types for GitHub App installation
+export interface InstallationRepository {
+  id: number;
+  owner: string;
+  name: string;
+  fullName: string;
+  description: string | null;
+  private: boolean;
+  defaultBranch: string;
+}
+
+export interface RepoMetadata {
+  description?: string;
+  aliases?: string[];
+  channelAssociations?: string[];
+  keywords?: string[];
+}
+
+export interface EnrichedRepository extends InstallationRepository {
+  metadata?: RepoMetadata;
+}
+
+// API response types
+export interface CreateSessionRequest {
+  repoOwner: string;
+  repoName: string;
+  title?: string;
+}
+
+export interface CreateSessionResponse {
+  sessionId: string;
+  status: SessionStatus;
+}
+
+export interface ListSessionsResponse {
+  sessions: Session[];
+  cursor?: string;
+  hasMore: boolean;
+}
+
+// Raygun integration types
+export interface RaygunConfig {
+  id: string;
+  repoId: string;
+  applicationId: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface RaygunIssue {
+  id: string;
+  errorMessage: string;
+  stackTracePreview: string;
+  occurrenceCount: number;
+  firstSeenAt: Date;
+  lastSeenAt: Date;
+  status: 'active' | 'resolved' | 'ignored';
+  affectedUsers: number;
+}
+
+export interface RaygunIssueDetail extends RaygunIssue {
+  fullStackTrace: string;
+  affectedFiles: string[];
+  context: {
+    environment: string;
+    version: string;
+    customData: Record<string, unknown>;
+  };
+  recentOccurrences: Array<{
+    timestamp: Date;
+    stackTrace: string;
+    context: Record<string, unknown>;
+  }>;
+}
+
+export interface RaygunFixSessionContext {
+  type: 'raygun-fix';
+  issueId: string;
+  issueUrl: string;
+  errorMessage: string;
+  fullStackTrace: string;
+  affectedFiles: string[];
+  occurrenceCount: number;
+  environment: string;
+  version: string;
+  customData: Record<string, unknown>;
+}
