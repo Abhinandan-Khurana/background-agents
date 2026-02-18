@@ -85,6 +85,46 @@ interface UseSessionSocketReturn {
   loadOlderEvents: () => void;
 }
 
+/**
+ * Collapse a batch of events by folding streaming token events into their
+ * final form (only the last accumulated token before execution_complete is kept).
+ * Mutates pendingTextRef to track in-flight tokens across calls.
+ */
+function collapseTokenEvents(
+  events: SandboxEvent[],
+  pendingTextRef: React.MutableRefObject<{
+    content: string;
+    messageId: string;
+    timestamp: number;
+  } | null>
+): SandboxEvent[] {
+  const result: SandboxEvent[] = [];
+  for (const evt of events) {
+    if (evt.type === "token" && evt.content && evt.messageId) {
+      pendingTextRef.current = {
+        content: evt.content,
+        messageId: evt.messageId,
+        timestamp: evt.timestamp,
+      };
+    } else if (evt.type === "execution_complete") {
+      if (pendingTextRef.current) {
+        const pending = pendingTextRef.current;
+        pendingTextRef.current = null;
+        result.push({
+          type: "token",
+          content: pending.content,
+          messageId: pending.messageId,
+          timestamp: pending.timestamp,
+        });
+      }
+      result.push(evt);
+    } else {
+      result.push(evt);
+    }
+  }
+  return result;
+}
+
 export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const connectingRef = useRef(false);
@@ -120,13 +160,8 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const cursorRef = useRef<{ timestamp: number; id: string } | null>(null);
 
-  // Live event buffering during replay
-  const replayCompleteRef = useRef(false);
-  const liveEventBufferRef = useRef<SandboxEvent[]>([]);
-
   /**
-   * Process a single sandbox_event through the existing logic.
-   * Extracted so it can be called both for live events and flushed buffer.
+   * Process a single live sandbox_event.
    */
   const processSandboxEvent = useCallback((event: SandboxEvent) => {
     if (event.type === "token" && event.content && event.messageId) {
@@ -176,19 +211,20 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
       isProcessing?: boolean;
       hasMore?: boolean;
       cursor?: { timestamp: number; id: string } | null;
+      replay?: {
+        events: SandboxEvent[];
+        hasMore: boolean;
+        cursor: { timestamp: number; id: string } | null;
+      };
+      spawnError?: string | null;
     }) => {
       switch (data.type) {
-        case "subscribed":
+        case "subscribed": {
           console.log("WebSocket subscribed to session");
           subscribedRef.current = true;
           // Clear existing state since we're about to receive fresh history
-          setEvents([]);
           setArtifacts([]);
           pendingTextRef.current = null;
-          // Reset replay buffering state
-          replayCompleteRef.current = false;
-          liveEventBufferRef.current = [];
-          setReplaying(true);
           if (data.state) {
             setSessionState(data.state);
           }
@@ -200,7 +236,19 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
           if (data.participant) {
             currentParticipantRef.current = data.participant;
           }
+
+          // Process batched replay events in a single state update
+          setEvents(data.replay ? collapseTokenEvents(data.replay.events, pendingTextRef) : []);
+          setHasMoreHistory(data.replay?.hasMore ?? false);
+          cursorRef.current = data.replay?.cursor ?? null;
+          setReplaying(false);
+
+          if (data.spawnError) {
+            console.error("Sandbox spawn error:", data.spawnError);
+            setSessionState((prev) => (prev ? { ...prev, sandboxStatus: "failed" } : null));
+          }
           break;
+        }
 
         case "prompt_queued":
           // Could show queue position indicator
@@ -208,60 +256,9 @@ export function useSessionSocket(sessionId: string): UseSessionSocketReturn {
 
         case "sandbox_event":
           if (data.event) {
-            const event = data.event;
-
-            // Buffer live events during initial replay to avoid interleaving
-            if (!replayCompleteRef.current) {
-              liveEventBufferRef.current.push(event);
-            } else {
-              processSandboxEvent(event);
-            }
+            processSandboxEvent(data.event);
           }
           break;
-
-        case "replay_complete": {
-          // Mark replay as complete
-          replayCompleteRef.current = true;
-          setReplaying(false);
-
-          // Set pagination state
-          setHasMoreHistory(data.hasMore ?? false);
-          cursorRef.current = data.cursor ?? null;
-
-          // Flush buffered live events in a single state update
-          const buffered = liveEventBufferRef.current;
-          liveEventBufferRef.current = [];
-          if (buffered.length > 0) {
-            const toAdd: SandboxEvent[] = [];
-            for (const evt of buffered) {
-              if (evt.type === "token" && evt.content && evt.messageId) {
-                pendingTextRef.current = {
-                  content: evt.content,
-                  messageId: evt.messageId,
-                  timestamp: evt.timestamp,
-                };
-              } else if (evt.type === "execution_complete") {
-                if (pendingTextRef.current) {
-                  const pending = pendingTextRef.current;
-                  pendingTextRef.current = null;
-                  toAdd.push({
-                    type: "token",
-                    content: pending.content,
-                    messageId: pending.messageId,
-                    timestamp: pending.timestamp,
-                  });
-                }
-                toAdd.push(evt);
-              } else {
-                toAdd.push(evt);
-              }
-            }
-            if (toAdd.length > 0) {
-              setEvents((prev) => [...prev, ...toAdd]);
-            }
-          }
-          break;
-        }
 
         case "history_page": {
           if (data.items) {
