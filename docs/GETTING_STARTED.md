@@ -2,8 +2,9 @@
 
 This guide walks you through deploying your own instance of Open-Inspect using Terraform.
 
-> **Important**: This system is designed for **single-tenant deployment only**. All users share the
-> same GitHub App credentials and can access any repository the App is installed on. See the
+> **Important**: This system is designed for **single-tenant deployment only**. All users share
+> provider credentials (GitHub App and/or Bitbucket bot credentials) and can access any repository
+> those credentials can access. See the
 > [Security Model](../README.md#security-model-single-tenant-only) for details.
 
 ---
@@ -194,28 +195,39 @@ You should now have:
 
 ## Step 3b: Configure Bitbucket Integration (Optional)
 
-If you want to support Bitbucket repositories, you'll need to set up an OAuth Consumer and a System Bot account.
+If you want to support Bitbucket repositories, set up both:
+
+- a Bitbucket OAuth Consumer (user sign-in, repo listing, PR creation)
+- a Bitbucket System Bot account (sandbox clone/push operations)
 
 ### 1. Create OAuth Consumer
+
 1. Go to your [Bitbucket Workspace Settings](https://bitbucket.org/account/workspaces/)
 2. Select your workspace -> **OAuth consumers** -> **Add consumer**
 3. Fill in the details:
    - **Name**: `Open-Inspect`
-   - **Callback URL**: `https://open-inspect-{your-deployment-name}.vercel.app/api/auth/callback/bitbucket`
+   - **Callback URL**:
+     `https://open-inspect-{your-deployment-name}.vercel.app/api/auth/callback/bitbucket`
 4. Set **Permissions**:
    - Account: **Read**
-   - Repositories: **Write** (required for creating PRs)
-   - Pull requests: **Read**
+   - Repositories: **Write**
+   - Pull requests: **Write** (recommended)
 5. Click **Save** and note the **Key** (Client ID) and **Secret** (Client Secret)
 
 ### 2. Create System Bot Account
-Since Bitbucket OAuth tokens expire quickly (1 hour), Open-Inspect uses a dedicated "System Bot" account for stable git operations (cloning/pushing) in background agents.
+
+Since Bitbucket OAuth tokens expire quickly (1 hour), Open-Inspect uses a dedicated "System Bot"
+account for stable git operations (cloning/pushing) in background agents.
 
 1. Create a new Bitbucket account for your bot (e.g., `your-org-bot`)
 2. Grant this user **Write** access to the repositories you want to use
 3. Log in as the bot user and go to **Personal settings** -> **App passwords**
-4. Create an App Password with **Repositories: Write** permission
+4. Create an App Password with **Repositories: Write** and **Pull requests: Write**
 5. Note the **Username** and **App Password**
+
+> **Important**: Keep `SCM_PROVIDER` at its default (`github`). Bitbucket is selected per-session
+> from the authenticated user/provider, while `SCM_PROVIDER=bitbucket` still routes to an
+> unimplemented source-control provider factory path.
 
 ---
 
@@ -333,6 +345,12 @@ github_app_private_key     = <<-EOF
 -----END PRIVATE KEY-----
 EOF
 
+# Bitbucket (Optional)
+bitbucket_client_id        = "your-consumer-key"
+bitbucket_client_secret    = "your-consumer-secret"
+bitbucket_bot_username     = "your-bot-username"
+bitbucket_bot_app_password = "your-bot-app-password"
+
 # Slack (leave as empty strings to disable Slack integration)
 slack_bot_token      = ""
 slack_signing_secret = ""
@@ -358,12 +376,12 @@ enable_durable_object_bindings = false
 enable_service_bindings        = false
 
 # Access Control (at least one recommended for security)
-allowed_users         = "your-github-username"  # Comma-separated GitHub usernames, or empty
-allowed_email_domains = ""                      # Comma-separated domains (e.g., "example.com,corp.io")
+allowed_users         = "your-username"  # Comma-separated GitHub/Bitbucket usernames, or empty
+allowed_email_domains = ""               # Comma-separated domains (e.g., "example.com,corp.io")
 ```
 
 > **Note**: Review `allowed_users` and `allowed_email_domains` carefully - these control who can
-> sign in. If both are empty, any GitHub user can access your deployment.
+> sign in. If both are empty, any authenticated user can access your deployment.
 
 ---
 
@@ -525,7 +543,7 @@ curl -I https://open-inspect-{deployment_name}.vercel.app
 ### Test the Full Flow
 
 1. Visit your web app URL
-2. Sign in with GitHub
+2. Sign in with GitHub or Bitbucket
 3. Create a new session with a repository
 4. Send a prompt and verify the sandbox starts
 
@@ -564,7 +582,7 @@ Go to your fork's Settings → Secrets and variables → Actions, and add:
 | `INTERNAL_CALLBACK_SECRET`    | Generated callback secret                                                    |
 | `MODAL_API_SECRET`            | Generated Modal API secret                                                   |
 | `NEXTAUTH_SECRET`             | Generated NextAuth secret                                                    |
-| `ALLOWED_USERS`               | Comma-separated GitHub usernames (or empty for all users)                    |
+| `ALLOWED_USERS`               | Comma-separated GitHub/Bitbucket usernames (or empty for all users)          |
 | `ALLOWED_EMAIL_DOMAINS`       | Comma-separated email domains (or empty for all domains)                     |
 
 **Bulk upload secrets with `gh` CLI:**
@@ -704,6 +722,7 @@ For details on the infrastructure components, see:
 - [terraform/README.md](../terraform/README.md) - Terraform module documentation
 - [README.md](../README.md) - System architecture overview
 - [OPENAI_MODELS.md](OPENAI_MODELS.md) - Configuring OpenAI Codex models
+
 # Getting Started with Open-Inspect
 
 This guide walks you through deploying your own instance of Open-Inspect using Terraform.
@@ -888,14 +907,17 @@ You should now have:
 
 ## Step 3b: Configure Bitbucket Integration (Optional)
 
-If you want to support Bitbucket repositories, you'll need to set up an OAuth Consumer and a System Bot account.
+If you want to support Bitbucket repositories, you'll need to set up an OAuth Consumer and a System
+Bot account.
 
 ### 1. Create OAuth Consumer
+
 1. Go to your [Bitbucket Workspace Settings](https://bitbucket.org/account/workspaces/)
 2. Select your workspace -> **OAuth consumers** -> **Add consumer**
 3. Fill in the details:
    - **Name**: `Open-Inspect`
-   - **Callback URL**: `https://open-inspect-{your-deployment-name}.vercel.app/api/auth/callback/bitbucket`
+   - **Callback URL**:
+     `https://open-inspect-{your-deployment-name}.vercel.app/api/auth/callback/bitbucket`
 4. Set **Permissions**:
    - Account: **Read**
    - Repositories: **Write** (required for creating PRs)
@@ -903,7 +925,9 @@ If you want to support Bitbucket repositories, you'll need to set up an OAuth Co
 5. Click **Save** and note the **Key** (Client ID) and **Secret** (Client Secret)
 
 ### 2. Create System Bot Account
-Since Bitbucket OAuth tokens expire quickly (1 hour), Open-Inspect uses a dedicated "System Bot" account for stable git operations (cloning/pushing) in background agents.
+
+Since Bitbucket OAuth tokens expire quickly (1 hour), Open-Inspect uses a dedicated "System Bot"
+account for stable git operations (cloning/pushing) in background agents.
 
 1. Create a new Bitbucket account for your bot (e.g., `your-org-bot`)
 2. Grant this user **Write** access to the repositories you want to use

@@ -184,7 +184,7 @@ When you create a session for a repo without an existing snapshot:
 ```
 
 1. **Sandbox created**: Modal spins up a new container from the base image
-2. **Git sync**: Clones your repository using GitHub App credentials
+2. **Git sync**: Clones your repository using provider credentials
 3. **Setup script**: Runs `.openinspect/setup.sh` if present (for `npm install`, etc.)
 4. **Agent start**: OpenCode server starts and connects back to the control plane
 5. **Ready**: Sandbox accepts prompts
@@ -307,9 +307,9 @@ This ensures your contributions are properly credited in git history.
 
 When you ask the agent to create a PR:
 
-1. Agent pushes the branch using GitHub App credentials
+1. Agent pushes the branch using provider credentials
 2. Control plane receives the branch name
-3. Control plane creates the PR using _your_ GitHub OAuth token
+3. Control plane creates the PR using _your_ OAuth token
 4. PR appears as created by you, not a bot
 
 This maintains proper code review workflows—you can't approve your own PRs.
@@ -392,9 +392,9 @@ same organization.
 
 ### Why Single-Tenant?
 
-The system uses a shared GitHub App installation for all git operations. This means:
+The system uses shared provider credentials for git operations. This means:
 
-- Any user can access any repository the GitHub App is installed on
+- Any user can access any repository available to the shared provider credentials
 - There's no per-user repository access validation
 - The trust boundary is your organization, not individual users
 
@@ -404,12 +404,13 @@ was built for internal use where all employees have access to company repositori
 
 ### Token Architecture
 
-| Token              | Purpose                              | Scope                            |
-| ------------------ | ------------------------------------ | -------------------------------- |
-| GitHub App Token   | Clone repos, push commits            | All repos where App is installed |
-| User OAuth Token   | Create PRs, identify users           | Repos the user has access to     |
-| Sandbox Auth Token | Authenticate sandbox → control plane | Single session                   |
-| WebSocket Token    | Authenticate client connections      | Single session                   |
+| Token                  | Purpose                              | Scope                            |
+| ---------------------- | ------------------------------------ | -------------------------------- |
+| GitHub App Token       | GitHub clone/push                    | All repos where App is installed |
+| Bitbucket App Password | Bitbucket clone/push                 | Repos accessible to bot account  |
+| User OAuth Token       | Create PRs, identify users           | Repos the user has access to     |
+| Sandbox Auth Token     | Authenticate sandbox → control plane | Single session                   |
+| WebSocket Token        | Authenticate client connections      | Single session                   |
 
 ### Repo-Scoped Secrets
 
@@ -423,7 +424,8 @@ You can configure environment variables (API keys, credentials) per repository:
 
 1. **Deploy behind SSO/VPN**: Control who can access the web interface
 2. **Limit GitHub App scope**: Only install on repositories you want accessible
-3. **Use "Select repositories"**: Don't give the App access to all org repos
+3. **Limit Bitbucket bot access**: Grant bot access only to required repositories
+4. **Use "Select repositories"**: Don't give the App access to all org repos
 
 ---
 

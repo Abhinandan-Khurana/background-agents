@@ -72,18 +72,23 @@ brew install node@22
 1. **Sign up** at [Modal](https://modal.com)
 2. **Create API Token** at Modal Settings
 
-### 5. GitHub Apps
+### 5. Source Control Auth
 
-1. **OAuth App** - For user authentication
+1. **GitHub App (OAuth + repo access)**
    - Create at: https://github.com/settings/developers
    - Callback URL: `https://<your-vercel-app>.vercel.app/api/auth/callback/github`
 
-2. **GitHub App** - For repository access in sandboxes
+2. **GitHub App private key conversion** (for repository access in sandboxes)
    - Create at: https://github.com/settings/apps
    - Convert private key to PKCS#8 format:
      ```bash
      openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in key.pem -out key-pkcs8.pem
      ```
+
+3. **Bitbucket OAuth Consumer + bot account (optional)**
+   - Callback URL: `https://<your-vercel-app>.vercel.app/api/auth/callback/bitbucket`
+   - Provide `bitbucket_client_id` / `bitbucket_client_secret` in `terraform.tfvars`
+   - Provide `bitbucket_bot_username` / `bitbucket_bot_app_password` in `terraform.tfvars`
 
 ### 6. Slack App
 

@@ -21,24 +21,28 @@ Open-Inspect provides a hosted background coding agent that can:
 
 ### How It Works
 
-The system uses a shared GitHub App installation for all git operations (clone, push). This means:
+The system uses shared provider credentials for git operations (clone, push):
 
-- **All users share the same GitHub App credentials** - The GitHub App must be installed on your
-  organization's repositories, and any user of the system can access any repo the App has access to
+- **GitHub flow** uses a shared GitHub App installation
+- **Bitbucket flow** uses a shared Bitbucket bot account (username + app password)
 - **No per-user repository access validation** - The system does not verify that a user has
   permission to access a specific repository before creating a session
-- **User OAuth tokens are used for PR creation** - PRs are created using the user's GitHub OAuth
-  token, ensuring proper attribution and that users can only create PRs on repos they have write
-  access to
+- **User OAuth tokens are used for PR creation** - PRs are created using the authenticated user's
+  provider token, ensuring proper attribution and that users can only create PRs on repos they can
+  access
+
+This means:
+
+- Any user of the system can access any repository available to the shared provider credentials
 
 ### Token Architecture
 
-| Token Type            | Purpose                | Scope                            |
-| --------------------- | ---------------------- | -------------------------------- |
-| GitHub App Token      | Clone repos, push code | All repos where App is installed |
-| Bitbucket App Password | Clone repos, push code | Repos accessible to Bot account |
-| User OAuth Token      | Create PRs, user info  | Repos user has access to         |
-| WebSocket Token       | Real-time session auth | Single session                   |
+| Token Type             | Purpose                | Scope                            |
+| ---------------------- | ---------------------- | -------------------------------- |
+| GitHub App Token       | Clone repos, push code | All repos where App is installed |
+| Bitbucket App Password | Clone repos, push code | Repos accessible to bot account  |
+| User OAuth Token       | Create PRs, user info  | Repos user has access to         |
+| WebSocket Token        | Real-time session auth | Single session                   |
 
 ### Why Single-Tenant Only
 
@@ -58,7 +62,8 @@ built for internal use where all employees are trusted and have access to compan
    web interface
 2. **Install GitHub App only on intended repositories** - The App's installation scope defines what
    the system can access
-3. **Use GitHub's repository selection** - When installing the App, select specific repositories
+3. **Restrict Bitbucket bot account access** - Grant bot credentials only on required repositories
+4. **Use GitHub's repository selection** - When installing the App, select specific repositories
    rather than "All repositories"
 
 ## Architecture

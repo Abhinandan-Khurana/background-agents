@@ -4,7 +4,7 @@ Next.js web application for interacting with Open-Inspect coding sessions.
 
 ## Features
 
-- GitHub OAuth authentication
+- GitHub and Bitbucket OAuth authentication
 - Session dashboard with list view
 - Real-time streaming via WebSocket
 - Message timeline with tool calls
@@ -25,7 +25,7 @@ Next.js web application for interacting with Open-Inspect coding sessions.
 │  └──────────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │                      API Routes                           │   │
-│  │  /api/auth/[...nextauth] - GitHub OAuth                  │   │
+│  │  /api/auth/[...nextauth] - GitHub/Bitbucket OAuth        │   │
 │  │  /api/sessions           - Session CRUD                  │   │
 │  │  /api/repos              - Repository list               │   │
 │  │  /api/repos/:owner/:name/secrets - Secrets CRUD          │   │
@@ -45,12 +45,14 @@ Next.js web application for interacting with Open-Inspect coding sessions.
 ### Prerequisites
 
 - Node.js 22+
-- GitHub App configured for OAuth (see below)
+- GitHub App configured for OAuth
+- Bitbucket OAuth Consumer configured if you plan to use Bitbucket
 
-### GitHub App Setup
+### OAuth Provider Setup
 
-The web client uses a **GitHub App** (not OAuth App) for user authentication. When creating the
-GitHub App:
+#### GitHub
+
+The web client uses a **GitHub App** (not GitHub OAuth App) for GitHub user authentication.
 
 1. Go to GitHub → Settings → Developer settings → GitHub Apps → New GitHub App
 2. Set the **Callback URL** to: `https://your-domain.com/api/auth/callback/github`
@@ -68,21 +70,34 @@ Required permissions for the GitHub App:
 - **Account permissions**: Email addresses (read-only)
 - **Repository permissions**: Contents (read & write) - for repo operations
 
+#### Bitbucket (Optional)
+
+1. Go to Bitbucket workspace settings → **OAuth consumers** → **Add consumer**
+2. Set the callback URL to: `https://your-domain.com/api/auth/callback/bitbucket`
+3. Set permissions:
+   - Account: **Read**
+   - Repositories: **Write**
+   - Pull requests: **Write** (recommended)
+
 ### Environment Variables
 
 Create `.env.local`:
 
 ```bash
-# GitHub App (for user authentication)
+# GitHub App (for GitHub sign-in)
 GITHUB_CLIENT_ID=your_github_app_client_id
 GITHUB_CLIENT_SECRET=your_github_app_client_secret
+
+# Bitbucket OAuth Consumer (for Bitbucket sign-in)
+BITBUCKET_CLIENT_ID=your_bitbucket_consumer_key
+BITBUCKET_CLIENT_SECRET=your_bitbucket_consumer_secret
 
 # NextAuth
 NEXTAUTH_URL=http://localhost:3000
 NEXTAUTH_SECRET=your_random_secret  # Generate: openssl rand -base64 32
 
 # Access Control (optional - leave empty to allow all authenticated users)
-ALLOWED_USERS=username1,username2          # Comma-separated GitHub usernames
+ALLOWED_USERS=username1,username2          # Comma-separated GitHub/Bitbucket usernames
 ALLOWED_EMAIL_DOMAINS=example.com,corp.io  # Comma-separated email domains
 
 # Control Plane
@@ -91,8 +106,8 @@ NEXT_PUBLIC_WS_URL=ws://localhost:8787
 ```
 
 > **Access Control**: If both `ALLOWED_USERS` and `ALLOWED_EMAIL_DOMAINS` are empty, any
-> authenticated GitHub user can access the application. If either is set, users must match at least
-> one condition (username in allowed list OR email domain in allowed list).
+> authenticated user can access the application. If either is set, users must match at least one
+> condition (username in allowed list OR email domain in allowed list).
 
 ### Development
 
@@ -120,7 +135,7 @@ npm run build
 
 ### New Session (`/session/new`)
 
-- Repository selector (populated from GitHub)
+- Repository selector (populated from the authenticated provider)
 - Optional title field
 - Creates session and redirects to session view
 

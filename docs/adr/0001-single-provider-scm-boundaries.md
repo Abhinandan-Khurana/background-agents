@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Superseded
+
+Superseded by the current implementation, which persists per-session `vcs_provider` (`github` or
+`bitbucket`) and supports Bitbucket OAuth + PR flows while still failing fast when
+`SCM_PROVIDER=bitbucket` is used with the unimplemented source-control provider factory path.
 
 ## Context
 

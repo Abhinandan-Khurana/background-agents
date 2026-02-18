@@ -53,7 +53,7 @@ Base image definition with:
 
 ### Auth (`src/auth/`)
 
-- **github_app.py**: GitHub App token generation for repo access
+- **github_app.py**: GitHub App token generation for GitHub repo access
 - **internal.py**: HMAC authentication for control plane requests
 
 ### API (`src/`)
@@ -85,6 +85,11 @@ modal secret create github-app \
   GITHUB_APP_ID="123456" \
   GITHUB_APP_PRIVATE_KEY="$(cat private-key-pkcs8.pem)" \
   GITHUB_APP_INSTALLATION_ID="12345678"
+
+# Bitbucket bot credentials (optional, required if using Bitbucket repos)
+modal secret create bitbucket-bot \
+  BITBUCKET_BOT_USERNAME="your-bot-username" \
+  BITBUCKET_BOT_APP_PASSWORD="your-bot-app-password"
 
 # Internal API secret (for control plane authentication)
 modal secret create internal-api \
@@ -160,6 +165,8 @@ Set via Modal secrets:
 | `GITHUB_APP_ID` | `github-app` | GitHub App ID for repo access |
 | `GITHUB_APP_PRIVATE_KEY` | `github-app` | GitHub App private key (PKCS#8) |
 | `GITHUB_APP_INSTALLATION_ID` | `github-app` | GitHub App installation ID |
+| `BITBUCKET_BOT_USERNAME` | `bitbucket-bot` | Bitbucket bot username for git auth |
+| `BITBUCKET_BOT_APP_PASSWORD` | `bitbucket-bot` | Bitbucket bot app password for git auth |
 | `MODAL_API_SECRET` | `internal-api` | Shared secret for control plane auth |
 | `ALLOWED_CONTROL_PLANE_HOSTS` | `internal-api` | Comma-separated allowed hostnames for URL validation |
 

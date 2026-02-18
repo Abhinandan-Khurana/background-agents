@@ -9,8 +9,8 @@ The control plane provides:
 - **Session Management**: SQLite-backed Durable Objects for each session
 - **Real-time Streaming**: WebSocket connections with hibernation support
 - **Multi-client Sync**: Web, Slack, extension clients all see the same state
-- **GitHub Integration**: GitHub App for repository access
-- **Token Encryption**: AES-256-GCM encryption for GitHub tokens at rest
+- **SCM Integration**: GitHub App and Bitbucket OAuth/Bot credentials
+- **Token Encryption**: AES-256-GCM encryption for OAuth tokens at rest
 - **Repo Secrets**: Encrypted repo-scoped secrets stored in D1, injected into sandboxes as env vars
 
 ## Architecture
@@ -162,7 +162,7 @@ All secrets and environment variables are configured through Terraform's `terraf
 Each session gets its own SQLite database with:
 
 - `session`: Core session state (repo, branch, status)
-- `participants`: Users with encrypted GitHub tokens
+- `participants`: Users with encrypted GitHub/Bitbucket tokens
 - `messages`: Prompt queue and history
 - `events`: Agent events (tool calls, tokens)
 - `artifacts`: PRs, screenshots, previews
@@ -173,7 +173,7 @@ See `src/session/schema.ts` for full schema.
 
 ## Token Encryption
 
-GitHub OAuth tokens are encrypted at rest using AES-256-GCM:
+OAuth tokens (GitHub and Bitbucket) are encrypted at rest using AES-256-GCM:
 
 ```typescript
 import { encryptToken, decryptToken } from "./auth/crypto";
@@ -190,26 +190,26 @@ const token = await decryptToken(encrypted, env.TOKEN_ENCRYPTION_KEY);
 > **Single-Tenant Only**: This control plane is designed for single-tenant deployment where all
 > users are trusted members of the same organization.
 
-### GitHub App Token Flow
+### Token Flow by Provider
 
-The system uses two types of GitHub tokens:
-
-| Token            | Used For    | Sent to Sandbox? | Access Scope                     |
-| ---------------- | ----------- | ---------------- | -------------------------------- |
-| GitHub App Token | Clone, push | Yes (ephemeral)  | All repos where App is installed |
-| User OAuth Token | Create PRs  | No (server-only) | User's accessible repos          |
+| Token / Credential        | Used For                  | Sent to Sandbox? | Access Scope                               |
+| ------------------------- | ------------------------- | ---------------- | ------------------------------------------ |
+| GitHub App Token          | GitHub clone/push         | Yes (ephemeral)  | Repos where the app is installed           |
+| Bitbucket Bot Credentials | Bitbucket clone/push      | Yes (ephemeral)  | Repos accessible to bot account            |
+| User OAuth Token          | Repo list, PR attribution | No (server-only) | Repos accessible to the authenticated user |
 
 If a `create-pr` request is triggered by a participant without a user OAuth token (for example,
-Slack-created sessions), the control-plane still pushes the branch with the GitHub App token and
-returns a manual GitHub `pull/new` URL instead of failing the request.
+Slack-created sessions), GitHub flow still pushes the branch and returns a manual GitHub `pull/new`
+URL instead of failing the request.
 
 ### Why This Matters
 
 - **No per-user repo access validation**: When a session is created, the system does not verify that
   the user has access to the requested repository
-- **Shared GitHub App installation**: A single `GITHUB_APP_INSTALLATION_ID` is used for all users
+- **Shared provider credentials**: Users share one GitHub App installation and/or Bitbucket bot
+  credentials
 - **Trust boundary is the organization**: All users with access to the web app can work with any
-  repository the GitHub App is installed on
+  repository available to those shared credentials
 
 ### Configuration
 
@@ -220,15 +220,17 @@ All secrets are configured via Terraform. Required secrets include:
 - `GITHUB_APP_INSTALLATION_ID` - Single installation for all users
 - `REPO_SECRETS_ENCRYPTION_KEY` - AES-GCM key for encrypting repo secrets in D1
 
-Optional variables:
+Bitbucket-related variables:
 
-- `SCM_PROVIDER` - Source control provider for this deployment (`github` or `bitbucket`, default:
-  `github`). Current implementation supports `github` only; `bitbucket` returns explicit
-  `501 Not Implemented` responses until implemented.
+- `BITBUCKET_CLIENT_ID` / `BITBUCKET_CLIENT_SECRET` - User OAuth configuration for Bitbucket sign-in
+- `BITBUCKET_BOT_USERNAME` / `BITBUCKET_BOT_APP_PASSWORD` - Bot credentials for Bitbucket git
+  operations
 
-See
-[terraform/environments/production/terraform.tfvars.example](../../terraform/environments/production/terraform.tfvars.example)
-for the complete list.
+`SCM_PROVIDER`:
+
+- Keep this as `github` (default).
+- Setting `SCM_PROVIDER=bitbucket` currently fails fast in the source-control provider factory.
+- Bitbucket routing is selected per-session using `vcs_provider` from authenticated user context.
 
 ### Deployment Recommendations
 
@@ -250,6 +252,7 @@ for the complete list.
 | Ping/pong WebSocket health         | Send ping, verify pong                |
 | Typing triggers sandbox warm       | Send typing, verify warming event     |
 | Presence sync on connect           | Connect 2 clients, verify presence    |
+
 # Open-Inspect Control Plane
 
 Cloudflare Workers + Durable Objects control plane for session management and real-time streaming.
@@ -464,7 +467,8 @@ for the complete list.
 
 1. Deploy behind SSO/VPN to restrict access to authorized employees
 2. Install the GitHub App only on repositories you want the system to access
-3. Use GitHub's "Only select repositories" option when installing the App
+3. Restrict Bitbucket bot account permissions to only required repositories
+4. Use GitHub's "Only select repositories" option when installing the App
 
 ## Verification Criteria
 
@@ -473,7 +477,7 @@ for the complete list.
 | Durable Object creates with SQLite | Create session, verify tables exist   |
 | WebSocket hibernation works        | Connect, idle 60s, send message       |
 | Multiple clients sync state        | Connect 2 clients, verify sync        |
-| GitHub OAuth flow completes        | Complete OAuth, verify token stored   |
+| OAuth flow completes               | Complete OAuth, verify token stored   |
 | Token encryption works             | Store/retrieve token, verify matches  |
 | Prompt queue ordering              | Enqueue 3 prompts, verify FIFO        |
 | Session survives DO eviction       | Create, wait, reconnect, verify state |
