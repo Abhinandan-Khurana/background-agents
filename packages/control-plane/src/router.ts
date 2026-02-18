@@ -1309,15 +1309,14 @@ async function refreshReposCache(env: Env, traceId?: string): Promise<void> {
   }
 }
 
-const REPOS_LIST_BITBUCKET_KEY = "repos:list:bitbucket";
-
 /**
  * List all repositories accessible via the GitHub App installation or Bitbucket user token.
  *
  * Uses stale-while-revalidate caching:
- * - Fresh cache (< 5 min old): return immediately
- * - Stale cache (5 min – 1 hr): return immediately, revalidate in background (GitHub only)
- * - No cache: fetch synchronously (first load or after 1 hr KV expiry)
+ * - GitHub: Fresh cache (< 5 min old): return immediately
+ * - GitHub: Stale cache (5 min – 1 hr): return immediately, revalidate in background
+ * - GitHub: No cache: fetch synchronously (first load or after 1 hr KV expiry)
+ * - Bitbucket: no KV cache (per-user token scope)
  *
  * For GitHub: Uses GitHub App installation token
  * For Bitbucket: Uses user's OAuth token from X-User-Token header
@@ -1330,12 +1329,44 @@ async function handleListRepos(
 ): Promise<Response> {
   const vcsProvider = (request.headers.get("X-VCS-Provider") || "github") as VCSProvider;
   const userToken = request.headers.get("X-User-Token");
-  const CACHE_KEY = vcsProvider === "bitbucket" ? REPOS_LIST_BITBUCKET_KEY : REPOS_CACHE_KEY;
+
+  // Bitbucket repos are scoped to each user's OAuth token, so avoid shared KV caching.
+  if (vcsProvider === "bitbucket") {
+    if (!userToken) {
+      return error("Bitbucket access token required (X-User-Token header)", 401);
+    }
+
+    try {
+      const bitbucketRepos = await listBitbucketRepos(userToken);
+
+      const repos: EnrichedRepository[] = bitbucketRepos.map((repo) => ({
+        id: 0,
+        owner: repo.workspace?.slug ?? "",
+        name: repo.slug,
+        fullName: repo.full_name,
+        description: null,
+        private: false,
+        defaultBranch: "main",
+      }));
+
+      return json({
+        repos,
+        cached: false,
+        cachedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      logger.error("Failed to list Bitbucket repositories", {
+        trace_id: ctx.trace_id,
+        error: e instanceof Error ? e : String(e),
+      });
+      return error("Failed to fetch repositories from Bitbucket", 500);
+    }
+  }
 
   let cached: CachedReposList | null = null;
   try {
     cached = await ctx.metrics.time("kv_read", () =>
-      env.REPOS_CACHE.get<CachedReposList>(CACHE_KEY, "json")
+      env.REPOS_CACHE.get<CachedReposList>(REPOS_CACHE_KEY, "json")
     );
   } catch (e) {
     logger.warn("Failed to read repos cache", { error: e instanceof Error ? e : String(e) });
@@ -1358,51 +1389,6 @@ async function handleListRepos(
       cached: true,
       cachedAt: cached.cachedAt,
     });
-  }
-
-  // Cache miss — Bitbucket: require user token and fetch from Bitbucket API
-  if (vcsProvider === "bitbucket") {
-    if (!userToken) {
-      return error("Bitbucket access token required (X-User-Token header)", 401);
-    }
-
-    try {
-      const bitbucketRepos = await listBitbucketRepos(userToken);
-
-      const repos: EnrichedRepository[] = bitbucketRepos.map((repo) => ({
-        id: 0,
-        owner: repo.workspace?.slug ?? "",
-        name: repo.slug,
-        fullName: repo.full_name,
-        description: null,
-        private: false,
-        defaultBranch: "main",
-      }));
-
-      const cachedAt = new Date().toISOString();
-      const freshUntil = Date.now() + REPOS_CACHE_FRESH_MS;
-      try {
-        await env.REPOS_CACHE.put(CACHE_KEY, JSON.stringify({ repos, cachedAt, freshUntil }), {
-          expirationTtl: REPOS_CACHE_KV_TTL_SECONDS,
-        });
-      } catch (e) {
-        logger.warn("Failed to cache Bitbucket repos list", {
-          error: e instanceof Error ? e : String(e),
-        });
-      }
-
-      return json({
-        repos,
-        cached: false,
-        cachedAt,
-      });
-    } catch (e) {
-      logger.error("Failed to list Bitbucket repositories", {
-        trace_id: ctx.trace_id,
-        error: e instanceof Error ? e : String(e),
-      });
-      return error("Failed to fetch repositories from Bitbucket", 500);
-    }
   }
 
   // Cache miss — GitHub: use GitHub App installation
@@ -1508,9 +1494,8 @@ async function handleUpdateRepoMetadata(
   try {
     await metadataStore.upsert(owner, name, metadata);
 
-    // Invalidate both GitHub and Bitbucket repos caches so next fetch includes updated metadata
+    // Invalidate GitHub repos cache so next fetch includes updated metadata
     await env.REPOS_CACHE.delete(REPOS_CACHE_KEY);
-    await env.REPOS_CACHE.delete(REPOS_LIST_BITBUCKET_KEY);
 
     // Return normalized repo identifier
     const normalizedRepo = `${owner.toLowerCase()}/${name.toLowerCase()}`;
