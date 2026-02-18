@@ -41,7 +41,6 @@ import {
   resolveScmProviderFromEnv,
   type SourceControlProvider,
   type SourceControlAuthContext,
-  type GitPushSpec,
 } from "../source-control";
 import {
   DEFAULT_MODEL,
@@ -49,7 +48,6 @@ import {
   isValidReasoningEffort,
   getDefaultReasoningEffort,
   getValidModelOrDefault,
-  extractProviderAndModel,
 } from "../utils/models";
 import type {
   Env,
@@ -64,11 +62,9 @@ import type {
   ParticipantRole,
   VCSProvider,
 } from "../types";
-import type { SessionRow, ParticipantRow, EventRow, ArtifactRow, SandboxRow, SandboxCommand } from "./types";
-import { SessionRepository, type MessageWithParticipant } from "./repository";
+import type { SessionRow, ParticipantRow, ArtifactRow, SandboxRow, SandboxCommand } from "./types";
+import { SessionRepository } from "./repository";
 import { SessionWebSocketManagerImpl, type SessionWebSocketManager } from "./websocket-manager";
-import { SessionPullRequestService } from "./pull-request-service";
-import { shouldPersistToolCallEvent } from "./event-persistence";
 import { RepoSecretsStore } from "../db/repo-secrets";
 import { SessionIndexStore } from "../db/session-index";
 import { GlobalSecretsStore } from "../db/global-secrets";
@@ -1077,6 +1073,65 @@ export class SessionDO extends DurableObject<Env> {
     const processingMessage = this.repository.getProcessingMessage();
     const messageId = eventMessageId ?? processingMessage?.id ?? null;
 
+    if (event.type === "execution_complete") {
+      if (messageId) {
+        this.repository.upsertExecutionCompleteEvent(messageId, event, now);
+      } else {
+        // Fallback for malformed payloads that omit messageId.
+        this.repository.createEvent({
+          id: generateId(),
+          type: event.type,
+          data: JSON.stringify(event),
+          messageId: null,
+          createdAt: now,
+        });
+      }
+
+      const completionMessageId = messageId;
+      const isStillProcessing =
+        completionMessageId != null && processingMessage?.id === completionMessageId;
+
+      if (isStillProcessing) {
+        const status = event.success ? "completed" : "failed";
+        this.repository.updateMessageCompletion(completionMessageId, status, now);
+
+        const timestamps = this.repository.getMessageTimestamps(completionMessageId);
+        const totalDurationMs = timestamps ? now - timestamps.created_at : undefined;
+        const processingDurationMs =
+          timestamps?.started_at != null ? now - timestamps.started_at : undefined;
+        const queueDurationMs =
+          timestamps?.started_at != null
+            ? timestamps.started_at - timestamps.created_at
+            : undefined;
+
+        this.log.info("prompt.complete", {
+          event: "prompt.complete",
+          message_id: completionMessageId,
+          outcome: event.success ? "success" : "failure",
+          message_status: status,
+          total_duration_ms: totalDurationMs,
+          processing_duration_ms: processingDurationMs,
+          queue_duration_ms: queueDurationMs,
+        });
+
+        this.broadcast({ type: "sandbox_event", event });
+        this.broadcast({ type: "processing_status", isProcessing: this.getIsProcessing() });
+        this.ctx.waitUntil(this.notifySlackBot(completionMessageId, event.success));
+      } else {
+        this.log.info("prompt.complete", {
+          event: "prompt.complete",
+          message_id: completionMessageId,
+          outcome: "already_stopped",
+        });
+      }
+
+      this.ctx.waitUntil(this.triggerSnapshot("execution_complete"));
+      this.updateLastActivity(now);
+      await this.scheduleInactivityCheck();
+      await this.processMessageQueue();
+      return;
+    }
+
     this.repository.createEvent({
       id: generateId(),
       type: event.type,
@@ -1275,6 +1330,12 @@ export class SessionDO extends DurableObject<Env> {
       message.reasoning_effort ??
       session?.reasoning_effort ??
       getDefaultReasoningEffort(resolvedModel);
+    const authorVcsProvider =
+      session?.vcs_provider === "bitbucket"
+        ? "bitbucket"
+        : session?.vcs_provider === "github"
+          ? "github"
+          : undefined;
 
     const command: SandboxCommand = {
       type: "prompt",
@@ -1284,8 +1345,11 @@ export class SessionDO extends DurableObject<Env> {
       reasoningEffort: resolvedEffort,
       author: {
         userId: author?.user_id ?? "unknown",
+        vcsProvider: authorVcsProvider,
         githubName: author?.github_name ?? null,
         githubEmail: author?.github_email ?? null,
+        bitbucketDisplayName: author?.bitbucket_display_name ?? null,
+        bitbucketEmail: author?.bitbucket_email ?? null,
       },
       attachments: message.attachments ? JSON.parse(message.attachments) : undefined,
     };
@@ -2485,7 +2549,14 @@ export class SessionDO extends DurableObject<Env> {
     );
 
     // Store and broadcast artifact
-    return this.storePRArtifact(prResult.htmlUrl, prResult.number, prResult.state, headBranch, baseBranch, sessionId);
+    return this.storePRArtifact(
+      prResult.htmlUrl,
+      prResult.number,
+      prResult.state,
+      headBranch,
+      baseBranch,
+      sessionId
+    );
   }
 
   /**
@@ -2498,7 +2569,10 @@ export class SessionDO extends DurableObject<Env> {
   ): Promise<Response> {
     // Get valid Bitbucket token (refresh if needed)
     if (!user.bitbucket_access_token_encrypted) {
-      return Response.json({ error: "No Bitbucket token available for PR creation" }, { status: 401 });
+      return Response.json(
+        { error: "No Bitbucket token available for PR creation" },
+        { status: 401 }
+      );
     }
 
     const accessToken = await getValidBitbucketToken(
@@ -2513,7 +2587,11 @@ export class SessionDO extends DurableObject<Env> {
     );
 
     // Get repository info to determine default branch
-    const repoInfo = await getBitbucketRepository(accessToken, session.repo_owner, session.repo_name);
+    const repoInfo = await getBitbucketRepository(
+      accessToken,
+      session.repo_owner,
+      session.repo_name
+    );
 
     const baseBranch = body.baseBranch || repoInfo.mainbranch?.name || "main";
     const sessionId = session.session_name || session.id;
@@ -2541,8 +2619,8 @@ export class SessionDO extends DurableObject<Env> {
     // Create the PR using Bitbucket API (using the prompting user's token)
     const prResult = await createBitbucketPR(
       accessToken,
-      session.repo_owner,  // workspace
-      session.repo_name,   // repo slug
+      session.repo_owner, // workspace
+      session.repo_name, // repo slug
       {
         title: body.title,
         body: fullBody,
@@ -2553,8 +2631,17 @@ export class SessionDO extends DurableObject<Env> {
 
     // Store and broadcast artifact
     // Bitbucket PR response has different structure
-    const prUrl = prResult.links?.html?.href || `https://bitbucket.org/${session.repo_owner}/${session.repo_name}/pull-requests/${prResult.id}`;
-    return this.storePRArtifact(prUrl, prResult.id, prResult.state || "OPEN", headBranch, baseBranch, sessionId);
+    const prUrl =
+      prResult.links?.html?.href ||
+      `https://bitbucket.org/${session.repo_owner}/${session.repo_name}/pull-requests/${prResult.id}`;
+    return this.storePRArtifact(
+      prUrl,
+      prResult.id,
+      prResult.state || "OPEN",
+      headBranch,
+      baseBranch,
+      sessionId
+    );
   }
 
   /**
@@ -2566,7 +2653,7 @@ export class SessionDO extends DurableObject<Env> {
     prState: string,
     headBranch: string,
     baseBranch: string,
-    sessionId: string
+    _sessionId: string
   ): Response {
     const artifactId = generateId();
     const now = Date.now();
