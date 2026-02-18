@@ -17,6 +17,17 @@ export interface SessionItem {
   updatedAt: number;
 }
 
+export function buildSessionHref(session: SessionItem) {
+  return {
+    pathname: `/session/${session.id}`,
+    query: {
+      repoOwner: session.repoOwner,
+      repoName: session.repoName,
+      ...(session.title ? { title: session.title } : {}),
+    },
+  };
+}
+
 interface SessionSidebarProps {
   onNewSession?: () => void;
   onToggle?: () => void;
@@ -204,10 +215,9 @@ function SessionListItem({
   const relativeTime = formatRelativeTime(timestamp);
   const displayTitle = session.title || `${session.repoOwner}/${session.repoName}`;
   const repoInfo = `${session.repoOwner}/${session.repoName}`;
-
   return (
     <Link
-      href={`/session/${session.id}`}
+      href={buildSessionHref(session)}
       onClick={() => {
         if (window.matchMedia("(max-width: 767px)").matches) {
           onSessionSelect?.();
