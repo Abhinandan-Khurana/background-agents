@@ -133,7 +133,7 @@ module "control_plane_worker" {
     var.enable_linear_bot ? [
       {
         binding_name = "LINEAR_BOT"
-        service_name = "open-inspect-linear-bot-${local.name_suffix}"
+        service_name = module.linear_bot_worker[0].worker_name
       }
     ] : []
   )
@@ -172,7 +172,7 @@ module "control_plane_worker" {
   compatibility_flags = ["nodejs_compat"]
   migration_tag       = "v1"
 
-  depends_on = [null_resource.control_plane_build, module.session_index_kv, null_resource.d1_migrations]
+  depends_on = [null_resource.control_plane_build, module.session_index_kv, null_resource.d1_migrations, module.linear_bot_worker]
 }
 
 # Build slack-bot worker bundle (only runs during apply, not plan)
@@ -346,7 +346,7 @@ module "linear_bot_worker" {
   compatibility_date  = "2024-09-23"
   compatibility_flags = ["nodejs_compat"]
 
-  depends_on = [null_resource.linear_bot_build[0], module.linear_kv[0], module.control_plane_worker]
+  depends_on = [null_resource.linear_bot_build[0], module.linear_kv[0]]
 }
 
 # =============================================================================
